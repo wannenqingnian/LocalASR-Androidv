@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.NoiseSuppressor
 import com.example.localasr.model.RecognitionMode
 import com.example.localasr.model.SpeechModel
 import com.k2fsa.sherpa.onnx.EndpointConfig
@@ -45,11 +46,13 @@ class SpeechRecorder(
     private val model: SpeechModel,
     private val modelDirectory: File,
     private val speakerModelDirectory: File?,
+    private val noiseSuppressionEnabled: Boolean,
     private val listener: SpeechRecorderListener,
 ) {
     @Volatile
     private var running = false
     private var audioRecord: AudioRecord? = null
+    private var noiseSuppressor: NoiseSuppressor? = null
     private var worker: Thread? = null
     private val committed = StringBuilder()
     private var currentTurnLabel: String? = null
@@ -153,6 +156,11 @@ class SpeechRecorder(
         committed.clear()
         currentTurnLabel = null
         startedAt = System.currentTimeMillis()
+        if (noiseSuppressionEnabled && NoiseSuppressor.isAvailable()) {
+            noiseSuppressor = runCatching {
+                NoiseSuppressor.create(recorder.audioSessionId)?.apply { enabled = true }
+            }.getOrNull()
+        }
         recorder.startRecording()
         listener.onReady(startedAt)
         return recorder
@@ -520,6 +528,8 @@ class SpeechRecorder(
     }
 
     private fun releaseRecorder() {
+        runCatching { noiseSuppressor?.release() }
+        noiseSuppressor = null
         try {
             audioRecord?.release()
         } catch (_: Exception) {

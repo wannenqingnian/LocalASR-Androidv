@@ -34,7 +34,9 @@ class AsrForegroundService : Service(), SpeechRecorderListener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> stopRecognition()
-            ACTION_START -> startRecognition()
+            ACTION_START -> startRecognition(
+                intent.getBooleanExtra(EXTRA_NOISE_SUPPRESSION, true),
+            )
         }
         return START_NOT_STICKY
     }
@@ -47,7 +49,7 @@ class AsrForegroundService : Service(), SpeechRecorderListener {
         super.onDestroy()
     }
 
-    private fun startRecognition() {
+    private fun startRecognition(noiseSuppressionEnabled: Boolean) {
         if (isActive) return
         isActive = true
         currentTranscript = ""
@@ -74,6 +76,7 @@ class AsrForegroundService : Service(), SpeechRecorderListener {
             speakerModelDirectory = ModelCatalog.speakerEmbedding
                 .takeIf { modelManager.isInstalled(it) }
                 ?.let { modelManager.modelDirectory(it) },
+            noiseSuppressionEnabled = noiseSuppressionEnabled,
             listener = this,
         ).also { it.start() }
     }
@@ -241,6 +244,7 @@ class AsrForegroundService : Service(), SpeechRecorderListener {
         const val ACTION_STOP = "com.example.localasr.action.STOP_ASR"
         const val ACTION_STATE_CHANGED = "com.example.localasr.action.ASR_STATE_CHANGED"
         const val STATE_PERMISSION = "com.example.localasr.permission.ASR_STATE"
+        const val EXTRA_NOISE_SUPPRESSION = "noise_suppression"
 
         @Volatile
         var isActive: Boolean = false

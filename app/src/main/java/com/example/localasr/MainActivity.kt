@@ -16,6 +16,7 @@ import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.audiofx.NoiseSuppressor
 import android.net.Uri
 import android.os.Bundle
 import android.os.Build
@@ -41,6 +42,7 @@ import android.widget.ProgressBar
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import com.example.localasr.asr.AsrForegroundService
@@ -72,6 +74,7 @@ class MainActivity : Activity() {
     private var recordingStatus: TextView? = null
     private var recordingDetail: TextView? = null
     private var recordingStatusDot: TextView? = null
+    private var noiseSuppressionSwitch: Switch? = null
     private var lastTranscript = ""
     private var pendingExportText = ""
     private var pendingRecordPermission = false
@@ -444,6 +447,43 @@ class MainActivity : Activity() {
         )
         page.addView(speakerCard, matchWrap().apply { bottomMargin = dp(12) })
 
+        val noiseSuppressionAvailable = NoiseSuppressor.isAvailable()
+        val noiseSuppressionEnabled = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+            .getBoolean(KEY_NOISE_SUPPRESSION, true) && noiseSuppressionAvailable
+        val noiseSuppressionCard = horizontalCard().apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(12), dp(14), dp(12))
+        }
+        val noiseSuppressionTexts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        noiseSuppressionTexts.addView(label("实时降噪", 14f, true), matchWrap())
+        val noiseSuppressionDetail = label("", 12f, false, COLOR_MUTED)
+        fun updateNoiseSuppressionDetail(enabled: Boolean) {
+            noiseSuppressionDetail.text = when {
+                !noiseSuppressionAvailable -> "当前设备不支持系统降噪"
+                enabled -> "已开启 · 过滤稳定背景噪音"
+                else -> "已关闭 · 使用原始麦克风音频"
+            }
+        }
+        updateNoiseSuppressionDetail(noiseSuppressionEnabled)
+        noiseSuppressionTexts.addView(noiseSuppressionDetail, topMargin(2))
+        noiseSuppressionCard.addView(
+            noiseSuppressionTexts,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        noiseSuppressionSwitch = Switch(this).apply {
+            isChecked = noiseSuppressionEnabled
+            isEnabled = noiseSuppressionAvailable && !AsrForegroundService.isActive
+            buttonTintList = ColorStateList.valueOf(COLOR_PRIMARY)
+            setOnCheckedChangeListener { _, enabled ->
+                getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
+                    .putBoolean(KEY_NOISE_SUPPRESSION, enabled)
+                    .apply()
+                updateNoiseSuppressionDetail(enabled)
+            }
+        }
+        noiseSuppressionCard.addView(noiseSuppressionSwitch, wrapWrap().apply { leftMargin = dp(8) })
+        page.addView(noiseSuppressionCard, matchWrap().apply { bottomMargin = dp(12) })
+
         val transcriptCard = verticalCard().apply {
             setPadding(dp(18), dp(16), dp(18), dp(18))
         }
@@ -598,6 +638,7 @@ class MainActivity : Activity() {
 
     private fun startRecording() {
         recordButton?.isEnabled = false
+        noiseSuppressionSwitch?.isEnabled = false
         recordingStatus?.text = "正在加载模型…"
         lastTranscript = ""
         transcriptView?.apply {
@@ -606,6 +647,11 @@ class MainActivity : Activity() {
         }
         val intent = Intent(this, AsrForegroundService::class.java)
             .setAction(AsrForegroundService.ACTION_START)
+            .putExtra(
+                AsrForegroundService.EXTRA_NOISE_SUPPRESSION,
+                getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                    .getBoolean(KEY_NOISE_SUPPRESSION, true),
+            )
         startForegroundService(intent)
     }
 
@@ -666,6 +712,8 @@ class MainActivity : Activity() {
                 16f,
             )
         }
+        noiseSuppressionSwitch?.isEnabled =
+            NoiseSuppressor.isAvailable() && !AsrForegroundService.isActive
         if (currentPage == Page.MODELS) refreshModelUi()
     }
 
@@ -1617,6 +1665,7 @@ class MainActivity : Activity() {
         private const val REQUEST_IMPORT_MODEL = 203
         private const val PREFERENCES = "settings"
         private const val KEY_SOURCE = "download_source"
+        private const val KEY_NOISE_SUPPRESSION = "noise_suppression"
         private val SPEAKER_LABEL = Regex("说话人\\d+")
         private val COLOR_BACKGROUND = 0xFFF6F8FC.toInt()
         private val COLOR_PRIMARY = 0xFF3563E9.toInt()
