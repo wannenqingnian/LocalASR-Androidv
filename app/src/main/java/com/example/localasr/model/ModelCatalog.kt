@@ -45,17 +45,17 @@ object ModelCatalog {
         id = "streaming-paraformer-bilingual-zh-en-int8",
         name = "通用普通话 / 英语",
         description = "实时显示文字，兼顾常见中文口音，约 237 MB",
-        repository = "csukuangfj/streaming-paraformer-zh",
+        repository = "csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en",
         mode = RecognitionMode.STREAMING,
         files = listOf(
             ModelFile(
-                remoteName = "model_quant.onnx",
+                remoteName = "encoder.int8.onnx",
                 localName = "encoder.int8.onnx",
-                size = 165_450_769L,
-                sha256 = "00b5f90549fff9f0b2a20a4c2ccf1b2335a3adb533f648ee768f79b29b777ce2",
+                size = 165_462_184L,
+                sha256 = "81a70226a8934e6ed92aa1d4fc486b428b5398e2f2619ed4897b7294cab90e9a",
             ),
             ModelFile(
-                remoteName = "decoder_quant.onnx",
+                remoteName = "decoder.int8.onnx",
                 localName = "decoder.int8.onnx",
                 size = 71_664_561L,
                 sha256 = "f3cca9f77bb9d93c8fcbfb63ae617b6b1ee96818df3aa3b151c40658fe38594f",
@@ -63,8 +63,8 @@ object ModelCatalog {
             ModelFile(
                 remoteName = "tokens.txt",
                 localName = "tokens.txt",
-                size = 34_846L,
-                sha256 = "fca8b98b28803e4235d6cd630e3666232bf55d3a34032c1cd7568c331ac213cd",
+                size = 75_756L,
+                sha256 = "59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6",
             ),
         ),
     )
