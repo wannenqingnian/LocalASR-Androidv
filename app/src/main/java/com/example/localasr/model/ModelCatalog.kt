@@ -52,13 +52,13 @@ object ModelCatalog {
                 remoteName = "model_quant.onnx",
                 localName = "encoder.int8.onnx",
                 size = 165_450_769L,
-                sha256 = "3c62ba3c52a2308c04ce3b0625b7eaef1ab36a13c3b5c790cfd9bc65872b149d",
+                sha256 = "00b5f90549fff9f0b2a20a4c2ccf1b2335a3adb533f648ee768f79b29b777ce2",
             ),
             ModelFile(
                 remoteName = "decoder_quant.onnx",
                 localName = "decoder.int8.onnx",
                 size = 71_664_561L,
-                sha256 = "620ecc014524456fd2c0518caff33f2fa99136aa194a1185e2437ea68ecdb7b9",
+                sha256 = "f3cca9f77bb9d93c8fcbfb63ae617b6b1ee96818df3aa3b151c40658fe38594f",
             ),
             ModelFile(
                 remoteName = "tokens.txt",
