@@ -324,7 +324,7 @@ class MainActivity : Activity() {
         drawer.addView(label("模型按需下载 · 音频仅在本机处理", 12f, false, COLOR_MUTED).apply {
             setPadding(dp(6), dp(12), dp(6), dp(4))
         }, matchWrap())
-        drawer.addView(label("版本 0.6.0", 11f, false, COLOR_MUTED).apply {
+        drawer.addView(label("版本 0.6.1", 11f, false, COLOR_MUTED).apply {
             setPadding(dp(6), 0, dp(6), 0)
         }, matchWrap())
         drawerLayer.addView(drawer, FrameLayout.LayoutParams(

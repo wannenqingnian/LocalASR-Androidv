@@ -49,6 +49,7 @@ class SpeechRecorder(
     private var audioRecord: AudioRecord? = null
     private var worker: Thread? = null
     private val committed = StringBuilder()
+    private var currentTurnLabel: String? = null
     private var startedAt = 0L
     private var speakerClusterer: SpeakerClusterer? = null
     private var speechDetector: SpeechActivityDetector? = null
@@ -316,16 +317,33 @@ class SpeechRecorder(
     private fun commit(text: String, samples: FloatArray): Boolean {
         if (text.isBlank()) return false
         if (!containsSpeech(samples)) return false
-        if (committed.isNotEmpty()) committed.append('\n')
-        if (hasOverlappingSpeech(samples)) {
-            committed.append("多人同时说话：")
+        val label = if (hasOverlappingSpeech(samples)) {
+            "多人同时说话"
         } else {
-            val speaker = assignSpeaker(samples)
-            if (speaker != null) committed.append("说话人").append(speaker).append('：')
+            assignSpeaker(samples)?.let { "说话人$it" }
         }
-        committed.append(text)
+        if (committed.isNotEmpty() && label != currentTurnLabel) committed.append('\n')
+        if (committed.isEmpty() || label != currentTurnLabel) {
+            if (label != null) committed.append(label).append('：')
+        } else if (needsWordSpace(committed.last(), text.first())) {
+            committed.append(' ')
+        }
+        committed.append(withSentencePunctuation(text))
+        currentTurnLabel = label
         return true
     }
+
+    private fun withSentencePunctuation(text: String): String {
+        val value = text.trim()
+        if (value.last() in SENTENCE_ENDINGS) return value
+        val withoutTrailingComma = value.trimEnd('，', ',', '、', '：', ':')
+        if (withoutTrailingComma.isEmpty()) return value
+        val punctuation = if (withoutTrailingComma.any { it in '\u3400'..'\u9fff' }) '。' else '.'
+        return "$withoutTrailingComma$punctuation"
+    }
+
+    private fun needsWordSpace(previous: Char, next: Char): Boolean =
+        previous.code < 128 && next.code < 128
 
     private fun hasOverlappingSpeech(samples: FloatArray): Boolean {
         val detector = overlapDetector ?: return false
@@ -475,5 +493,6 @@ class SpeechRecorder(
         private const val OFFLINE_QUEUE_CAPACITY = 4
         private const val OFFLINE_SHUTDOWN_TIMEOUT_SECONDS = 120L
         private const val MIN_AUDIBLE_POWER = 0.000016
+        private val SENTENCE_ENDINGS = setOf('。', '！', '？', '!', '?', '；', ';', '.', '…')
     }
 }
