@@ -40,6 +40,11 @@ class HistoryDatabase(context: Context) :
         writableDatabase.update("sessions", values, "id = ?", arrayOf(id.toString()))
     }
 
+    fun updateText(id: Long, text: String) {
+        val values = ContentValues().apply { put("transcript", text) }
+        writableDatabase.update("sessions", values, "id = ?", arrayOf(id.toString()))
+    }
+
     fun list(): List<TranscriptSession> {
         val result = mutableListOf<TranscriptSession>()
         readableDatabase.query(

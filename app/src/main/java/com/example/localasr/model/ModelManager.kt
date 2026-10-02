@@ -41,9 +41,9 @@ class ModelManager(context: Context) {
         preferences.edit().putString(KEY_SELECTED_MODEL, model.id).apply()
     }
 
-    fun modelDirectory(model: SpeechModel): File = File(modelsRoot, model.id)
+    fun modelDirectory(model: DownloadableModel): File = File(modelsRoot, model.id)
 
-    fun isInstalled(model: SpeechModel = selectedModel): Boolean {
+    fun isInstalled(model: DownloadableModel = selectedModel): Boolean {
         val root = modelDirectory(model)
         if (!File(root, READY_MARKER).isFile) return false
         return model.files.all {
@@ -52,7 +52,7 @@ class ModelManager(context: Context) {
         }
     }
 
-    fun downloadedBytes(model: SpeechModel = selectedModel): Long {
+    fun downloadedBytes(model: DownloadableModel = selectedModel): Long {
         val root = modelDirectory(model)
         return model.files.sumOf { item ->
             val finalFile = File(root, item.localName)
@@ -66,7 +66,7 @@ class ModelManager(context: Context) {
     }
 
     fun download(
-        model: SpeechModel = selectedModel,
+        model: DownloadableModel = selectedModel,
         source: DownloadSource,
         onProgress: (DownloadProgress) -> Unit,
         onResult: (DownloadResult) -> Unit,
@@ -96,7 +96,7 @@ class ModelManager(context: Context) {
     }
 
     fun importModel(
-        model: SpeechModel,
+        model: DownloadableModel,
         filesByName: Map<String, Uri>,
         onProgress: (DownloadProgress) -> Unit,
         onResult: (DownloadResult) -> Unit,
@@ -172,14 +172,14 @@ class ModelManager(context: Context) {
         pauseRequested.set(true)
     }
 
-    fun deleteModel(model: SpeechModel = selectedModel) {
+    fun deleteModel(model: DownloadableModel = selectedModel) {
         pause()
         val root = modelDirectory(model)
         if (root.exists()) root.deleteRecursively()
     }
 
     private fun downloadFile(
-        model: SpeechModel,
+        model: DownloadableModel,
         source: DownloadSource,
         item: ModelFile,
         root: File,
@@ -237,7 +237,7 @@ class ModelManager(context: Context) {
         }
     }
 
-    private fun completedBytesBefore(model: SpeechModel, root: File, current: ModelFile): Long {
+    private fun completedBytesBefore(model: DownloadableModel, root: File, current: ModelFile): Long {
         var bytes = 0L
         for (item in model.files) {
             if (item == current) break
@@ -247,7 +247,7 @@ class ModelManager(context: Context) {
         return bytes
     }
 
-    private fun validateModel(model: SpeechModel, root: File, onProgress: (DownloadProgress) -> Unit) {
+    private fun validateModel(model: DownloadableModel, root: File, onProgress: (DownloadProgress) -> Unit) {
         model.files.forEachIndexed { index, item ->
             if (pauseRequested.get()) throw PausedException()
             val file = File(root, item.localName)

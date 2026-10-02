@@ -49,6 +49,7 @@ import com.example.localasr.history.TranscriptSession
 import com.example.localasr.model.DownloadProgress
 import com.example.localasr.model.DownloadResult
 import com.example.localasr.model.DownloadSource
+import com.example.localasr.model.DownloadableModel
 import com.example.localasr.model.ModelCatalog
 import com.example.localasr.model.ModelManager
 import com.example.localasr.model.RecognitionMode
@@ -77,7 +78,7 @@ class MainActivity : Activity() {
     private var pendingImportModelId: String? = null
 
     private var downloading = false
-    private var downloadingModel: SpeechModel? = null
+    private var downloadingModel: DownloadableModel? = null
     private var importingModel = false
     private var selectedSource = DownloadSource.DOMESTIC
     private var drawerOpen = false
@@ -323,7 +324,7 @@ class MainActivity : Activity() {
         drawer.addView(label("模型按需下载 · 音频仅在本机处理", 12f, false, COLOR_MUTED).apply {
             setPadding(dp(6), dp(12), dp(6), dp(4))
         }, matchWrap())
-        drawer.addView(label("版本 0.5.0", 11f, false, COLOR_MUTED).apply {
+        drawer.addView(label("版本 0.6.0", 11f, false, COLOR_MUTED).apply {
             setPadding(dp(6), 0, dp(6), 0)
         }, matchWrap())
         drawerLayer.addView(drawer, FrameLayout.LayoutParams(
@@ -413,6 +414,36 @@ class MainActivity : Activity() {
         )
         page.addView(modelSwitchCard, matchWrap().apply { bottomMargin = dp(12) })
 
+        val speakerReady = modelManager.isInstalled(ModelCatalog.speakerEmbedding)
+        val speakerCard = horizontalCard().apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(12), dp(14), dp(12))
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { showModels() }
+        }
+        val speakerTexts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        speakerTexts.addView(label("说话人音色区分", 14f, true), matchWrap())
+        speakerTexts.addView(
+            label(
+                if (speakerReady) "已开启 · 自动标记说话人1/2/3" else "未安装 · 点击前往模型管理",
+                12f,
+                false,
+                COLOR_MUTED,
+            ),
+            topMargin(2),
+        )
+        speakerCard.addView(speakerTexts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        speakerCard.addView(
+            chip(
+                if (speakerReady) "已开启" else "未开启",
+                if (speakerReady) COLOR_SUCCESS else COLOR_WARNING,
+                if (speakerReady) COLOR_SUCCESS_SOFT else COLOR_WARNING_SOFT,
+            ),
+            wrapWrap().apply { leftMargin = dp(8) },
+        )
+        page.addView(speakerCard, matchWrap().apply { bottomMargin = dp(12) })
+
         val transcriptCard = verticalCard().apply {
             setPadding(dp(18), dp(16), dp(18), dp(18))
         }
@@ -468,10 +499,13 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-        transcriptActions.addView(textAction("复制") { copyTranscript() }, weightedAction())
+        transcriptActions.addView(textAction("改名") { renameCurrentSpeakers() }, weightedAction())
+        transcriptActions.addView(textAction("复制") { copyTranscript() }, weightedAction().apply {
+            leftMargin = dp(6)
+        })
         transcriptActions.addView(textAction("整篇分享") { shareTranscript() }, weightedAction().apply {
-            leftMargin = dp(8)
-            rightMargin = dp(8)
+            leftMargin = dp(6)
+            rightMargin = dp(6)
         })
         transcriptActions.addView(textAction("导出") { exportTranscript() }, weightedAction())
         transcriptCard.addView(transcriptActions, LinearLayout.LayoutParams(
@@ -637,6 +671,63 @@ class MainActivity : Activity() {
 
     private fun transcriptText(): String = transcriptView?.text?.toString()?.trim().orEmpty()
 
+    private fun renameCurrentSpeakers() {
+        if (AsrForegroundService.isActive) {
+            showMessage("请先停止并保存，再修改说话人姓名")
+            return
+        }
+        showSpeakerRenameDialog(transcriptText()) { updatedText ->
+            lastTranscript = updatedText
+            transcriptView?.apply {
+                setText(updatedText)
+                setSelection(text.length)
+            }
+            AsrForegroundService.lastSavedSessionId.takeIf { it != 0L }?.let { sessionId ->
+                historyDatabase.updateText(sessionId, updatedText)
+                AsrForegroundService.updateLastSavedTranscript(sessionId, updatedText)
+            }
+            showMessage("说话人姓名已统一修改")
+        }
+    }
+
+    private fun showSpeakerRenameDialog(text: String, onRenamed: (String) -> Unit) {
+        val labels = SPEAKER_LABEL.findAll(text)
+            .map { it.groupValues[1] }
+            .distinct()
+            .toList()
+        if (labels.isEmpty()) {
+            showMessage("当前文字中没有可改名的说话人标签")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("选择要改名的说话人")
+            .setItems(labels.toTypedArray()) { _, which ->
+                val oldName = labels[which]
+                val input = EditText(this).apply {
+                    hint = "输入真实姓名"
+                    inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
+                    setSingleLine(true)
+                    setPadding(dp(20), dp(12), dp(20), dp(12))
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("将“$oldName”统一改名")
+                    .setView(input)
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("保存") { _, _ ->
+                        val newName = input.text.toString().trim()
+                        if (newName.isBlank()) {
+                            showMessage("姓名不能为空")
+                            return@setPositiveButton
+                        }
+                        val lineLabel = Regex("(?m)^${Regex.escape(oldName)}：")
+                        onRenamed(lineLabel.replace(text) { "$newName：" })
+                    }
+                    .show()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
     private fun copyTranscript() {
         val text = transcriptText()
         if (text.isBlank()) {
@@ -707,7 +798,7 @@ class MainActivity : Activity() {
         body.addView(privacyCard, matchWrap().apply { bottomMargin = dp(12) })
 
         body.addView(downloadSourceCard(), matchWrap().apply { bottomMargin = dp(16) })
-        val installedCount = ModelCatalog.models.count { modelManager.isInstalled(it) }
+        val installedCount = ModelCatalog.downloadableModels.count { modelManager.isInstalled(it) }
         val modelsHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -717,13 +808,18 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
         )
         modelsHeader.addView(
-            chip("已安装 $installedCount/${ModelCatalog.models.size}", COLOR_PRIMARY, COLOR_PRIMARY_SOFT),
+            chip("已安装 $installedCount/${ModelCatalog.downloadableModels.size}", COLOR_PRIMARY, COLOR_PRIMARY_SOFT),
             wrapWrap(),
         )
         body.addView(modelsHeader, matchWrap().apply { bottomMargin = dp(10) })
         ModelCatalog.models.forEach { model ->
             body.addView(modelManagementCard(model), matchWrap().apply { bottomMargin = dp(12) })
         }
+        body.addView(label("辅助模型", 17f, true), topMargin(6).apply { bottomMargin = dp(10) })
+        body.addView(
+            modelManagementCard(ModelCatalog.speakerEmbedding),
+            matchWrap().apply { bottomMargin = dp(12) },
+        )
         body.addView(
             label(
                 "下载支持暂停和断点续传；本地导入需一次选择该模型所需的全部文件。两种方式都会执行大小与 SHA-256 校验。",
@@ -773,7 +869,7 @@ class MainActivity : Activity() {
         addView(sources, matchWrap())
     }
 
-    private fun modelManagementCard(model: SpeechModel): View = verticalCard().apply {
+    private fun modelManagementCard(model: DownloadableModel): View = verticalCard().apply {
         setPadding(dp(18), dp(17), dp(18), dp(18))
         val titleRow = LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -785,7 +881,11 @@ class MainActivity : Activity() {
         titleRow.addView(titleTexts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         titleRow.addView(
             chip(
-                if (model.mode == RecognitionMode.OFFLINE) "分段识别" else "实时识别",
+                when {
+                    model !is SpeechModel -> "音色区分"
+                    model.mode == RecognitionMode.OFFLINE -> "分段识别"
+                    else -> "实时识别"
+                },
                 COLOR_PRIMARY,
                 COLOR_PRIMARY_SOFT,
             ),
@@ -859,8 +959,8 @@ class MainActivity : Activity() {
         setTextIsSelectable(true)
     }
 
-    private fun modelRepositoryUrl(source: DownloadSource, model: SpeechModel): String =
-        "${source.huggingFaceHost}/${model.repository}"
+    private fun modelRepositoryUrl(source: DownloadSource, model: DownloadableModel): String =
+        model.repositoryUrl(source)
 
     private fun copyModelUrl(url: String) {
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -868,7 +968,7 @@ class MainActivity : Activity() {
         showMessage("模型地址已复制")
     }
 
-    private fun startDownload(model: SpeechModel) {
+    private fun startDownload(model: DownloadableModel) {
         if (downloading || AsrForegroundService.isActive) {
             showMessage("请先暂停当前任务或停止转写")
             return
@@ -896,7 +996,7 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun requestModelImport(model: SpeechModel) {
+    private fun requestModelImport(model: DownloadableModel) {
         if (downloading || AsrForegroundService.isActive) {
             showMessage("请先暂停当前任务或停止转写")
             return
@@ -914,7 +1014,7 @@ class MainActivity : Activity() {
 
     private fun handleModelImportResult(data: Intent?) {
         val modelId = pendingImportModelId ?: return
-        val model = ModelCatalog.find(modelId)
+        val model = ModelCatalog.findDownloadable(modelId) ?: return
         pendingImportModelId = null
         val uris = buildList {
             data?.clipData?.let { clips ->
@@ -976,7 +1076,7 @@ class MainActivity : Activity() {
     }
 
     private fun refreshModelUi() {
-        ModelCatalog.models.forEach { model ->
+        ModelCatalog.downloadableModels.forEach { model ->
             val installed = modelManager.isInstalled(model)
             val downloaded = modelManager.downloadedBytes(model)
             val isActive = downloading && downloadingModel?.id == model.id
@@ -1005,7 +1105,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun confirmDeleteModel(model: SpeechModel) {
+    private fun confirmDeleteModel(model: DownloadableModel) {
         if (downloading) return
         if (AsrForegroundService.isActive) {
             showMessage("请先停止当前转写，再删除模型")
@@ -1296,13 +1396,35 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle(formatHistoryDate(session.startedAt))
             .setView(ScrollView(this).apply { addView(textView) })
-            .setNeutralButton("删除") { _, _ -> confirmDeleteHistory(session) }
+            .setNeutralButton("更多") { _, _ -> textView.post { showHistoryActions(session) } }
             .setNegativeButton("关闭", null)
             .setPositiveButton("复制") { _, _ ->
                 val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 clipboard.setPrimaryClip(ClipData.newPlainText("语音转写", session.text))
                 showMessage("已复制")
             }
+            .show()
+    }
+
+    private fun showHistoryActions(session: TranscriptSession) {
+        AlertDialog.Builder(this)
+            .setTitle("记录操作")
+            .setItems(arrayOf("说话人改名", "删除记录")) { _, which ->
+                if (which == 0) {
+                    showSpeakerRenameDialog(session.text) { updatedText ->
+                        historyDatabase.updateText(session.id, updatedText)
+                        if (AsrForegroundService.lastSavedSessionId == session.id) {
+                            lastTranscript = updatedText
+                            AsrForegroundService.updateLastSavedTranscript(session.id, updatedText)
+                        }
+                        showMessage("说话人姓名已统一修改")
+                        showHistoryDetails(session.copy(text = updatedText))
+                    }
+                } else {
+                    confirmDeleteHistory(session)
+                }
+            }
+            .setNegativeButton("取消", null)
             .show()
     }
 
@@ -1476,6 +1598,7 @@ class MainActivity : Activity() {
         private const val REQUEST_IMPORT_MODEL = 203
         private const val PREFERENCES = "settings"
         private const val KEY_SOURCE = "download_source"
+        private val SPEAKER_LABEL = Regex("(?m)^(说话人\\d+)：")
         private val COLOR_BACKGROUND = 0xFFF6F8FC.toInt()
         private val COLOR_PRIMARY = 0xFF3563E9.toInt()
         private val COLOR_PRIMARY_SOFT = 0xFFEEF4FF.toInt()

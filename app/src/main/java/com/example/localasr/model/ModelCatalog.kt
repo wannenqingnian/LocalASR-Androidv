@@ -22,23 +22,50 @@ data class ModelFile(
     val size: Long,
     val sha256: String,
     val directUrl: String? = null,
+    val domesticUrl: String? = null,
+    val officialUrl: String? = null,
 )
 
-data class SpeechModel(
-    val id: String,
-    val name: String,
-    val description: String,
-    val repository: String,
-    val mode: RecognitionMode,
-    val files: List<ModelFile>,
-) {
-    val totalBytes: Long = files.sumOf { it.size }
+interface DownloadableModel {
+    val id: String
+    val name: String
+    val description: String
+    val repository: String
+    val files: List<ModelFile>
+
+    val totalBytes: Long
+        get() = files.sumOf { it.size }
 
     fun downloadUrl(source: DownloadSource, file: ModelFile): String {
-        return file.directUrl
-            ?: "${source.huggingFaceHost}/$repository/resolve/main/${file.remoteName}"
+        return when (source) {
+            DownloadSource.DOMESTIC -> file.domesticUrl
+            DownloadSource.OFFICIAL -> file.officialUrl
+        } ?: file.directUrl
+        ?: "${source.huggingFaceHost}/$repository/resolve/main/${file.remoteName}"
     }
+
+    fun repositoryUrl(source: DownloadSource): String = when (source) {
+        DownloadSource.DOMESTIC -> files.firstOrNull()?.domesticUrl
+        DownloadSource.OFFICIAL -> files.firstOrNull()?.officialUrl
+    } ?: if (repository.startsWith("http")) repository else "${source.huggingFaceHost}/$repository"
 }
+
+data class SpeechModel(
+    override val id: String,
+    override val name: String,
+    override val description: String,
+    override val repository: String,
+    val mode: RecognitionMode,
+    override val files: List<ModelFile>,
+) : DownloadableModel
+
+data class AuxiliaryModel(
+    override val id: String,
+    override val name: String,
+    override val description: String,
+    override val repository: String,
+    override val files: List<ModelFile>,
+) : DownloadableModel
 
 object ModelCatalog {
     val streamingParaformer = SpeechModel(
@@ -126,7 +153,43 @@ object ModelCatalog {
         ),
     )
 
+    val speakerEmbedding = AuxiliaryModel(
+        id = "speaker-embedding-campplus-zh",
+        name = "中文音色区分",
+        description = "过滤静音、标记重叠讲话，并按音色区分说话人，约 34.5 MB",
+        repository = "https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recongition-models",
+        files = listOf(
+            ModelFile(
+                remoteName = "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+                localName = "speaker.onnx",
+                size = 28_281_138L,
+                sha256 = "f682b514c05d947ee3fa91cd6ec6c5c7543479a128373fa29b1faedccd21fd11",
+                domesticUrl = "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+                officialUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+            ),
+            ModelFile(
+                remoteName = "silero_vad.int8.onnx",
+                localName = "vad.onnx",
+                size = 212_860L,
+                sha256 = "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20",
+                domesticUrl = "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.int8.onnx",
+                officialUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.int8.onnx",
+            ),
+            ModelFile(
+                remoteName = "model.onnx",
+                localName = "overlap.onnx",
+                size = 5_992_913L,
+                sha256 = "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079",
+                domesticUrl = "https://hf-mirror.com/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.onnx",
+                officialUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.onnx",
+            ),
+        ),
+    )
+
     val models = listOf(streamingParaformer, streamingTrilingual, offlineChuan)
+    val downloadableModels: List<DownloadableModel> = models + speakerEmbedding
 
     fun find(id: String?): SpeechModel = models.firstOrNull { it.id == id } ?: streamingParaformer
+
+    fun findDownloadable(id: String?): DownloadableModel? = downloadableModels.firstOrNull { it.id == id }
 }

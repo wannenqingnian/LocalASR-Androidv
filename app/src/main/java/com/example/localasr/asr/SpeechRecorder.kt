@@ -23,9 +23,6 @@ import com.k2fsa.sherpa.onnx.SileroVadModelConfig
 import com.k2fsa.sherpa.onnx.Vad
 import com.k2fsa.sherpa.onnx.VadModelConfig
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -44,6 +41,7 @@ class SpeechRecorder(
     private val context: Context,
     private val model: SpeechModel,
     private val modelDirectory: File,
+    private val speakerModelDirectory: File?,
     private val listener: SpeechRecorderListener,
 ) {
     @Volatile
@@ -52,12 +50,29 @@ class SpeechRecorder(
     private var worker: Thread? = null
     private val committed = StringBuilder()
     private var startedAt = 0L
+    private var speakerClusterer: SpeakerClusterer? = null
+    private var speechDetector: SpeechActivityDetector? = null
+    private var overlapDetector: OverlapSpeechDetector? = null
 
     fun start() {
         check(!running) { "录音已在运行" }
         running = true
         worker = thread(name = "asr-recorder") {
             try {
+                speakerClusterer = speakerModelDirectory?.let {
+                    runCatching { SpeakerClusterer(File(it, "speaker.onnx")) }.getOrNull()
+                }
+                speechDetector = speakerModelDirectory?.let {
+                    runCatching { SpeechActivityDetector(File(it, "vad.onnx")) }.getOrNull()
+                }
+                overlapDetector = speakerModelDirectory?.let {
+                    runCatching {
+                        OverlapSpeechDetector(
+                            segmentationModel = File(it, "overlap.onnx"),
+                            embeddingModel = File(it, "speaker.onnx"),
+                        )
+                    }.getOrNull()
+                }
                 when (model.mode) {
                     RecognitionMode.STREAMING -> startStreaming()
                     RecognitionMode.OFFLINE -> startOffline()
@@ -66,6 +81,13 @@ class SpeechRecorder(
                 running = false
                 releaseRecorder()
                 listener.onError(error.message ?: "语音识别启动失败")
+            } finally {
+                speakerClusterer?.release()
+                speakerClusterer = null
+                speechDetector?.release()
+                speechDetector = null
+                overlapDetector?.release()
+                overlapDetector = null
             }
         }
     }
@@ -139,12 +161,18 @@ class SpeechRecorder(
     private fun recognizeStreaming(recognizer: OnlineRecognizer, recorder: AudioRecord) {
         val stream = recognizer.createStream()
         val buffer = ShortArray(SAMPLE_RATE / 10)
+        val segmentAudio = mutableListOf<FloatArray>()
+        var segmentSampleCount = 0
+        var segmentSquaredSum = 0.0
         var currentText = ""
         try {
             while (running) {
                 val count = recorder.read(buffer, 0, buffer.size)
                 if (count <= 0) continue
                 val samples = FloatArray(count) { buffer[it] / 32768.0f }
+                segmentAudio += samples
+                segmentSampleCount += samples.size
+                for (sample in samples) segmentSquaredSum += sample * sample
                 stream.acceptWaveform(samples, SAMPLE_RATE)
                 while (recognizer.isReady(stream)) recognizer.decode(stream)
 
@@ -157,9 +185,15 @@ class SpeechRecorder(
                     currentText = recognizer.getResult(stream).text.trim()
                 }
 
-                listener.onTranscriptChanged(combinedText(currentText))
+                listener.onTranscriptChanged(
+                    combinedText(currentText, hasAudibleSignal(segmentSquaredSum, segmentSampleCount)),
+                )
                 if (endpoint) {
-                    if (commit(currentText)) listener.onSegmentFinalized(committed.toString())
+                    val speakerSamples = joinSamples(segmentAudio, segmentSampleCount)
+                    if (commit(currentText, speakerSamples)) listener.onSegmentFinalized(committed.toString())
+                    segmentAudio.clear()
+                    segmentSampleCount = 0
+                    segmentSquaredSum = 0.0
                     currentText = ""
                     recognizer.reset(stream)
                     listener.onTranscriptChanged(committed.toString())
@@ -171,13 +205,17 @@ class SpeechRecorder(
             stream.inputFinished()
             while (recognizer.isReady(stream)) recognizer.decode(stream)
             val finalText = recognizer.getResult(stream).text.trim().ifBlank { currentText }
-            if (commit(finalText)) listener.onSegmentFinalized(committed.toString())
+            if (commit(finalText, joinSamples(segmentAudio, segmentSampleCount))) {
+                listener.onSegmentFinalized(committed.toString())
+            }
             listener.onFinished(committed.toString(), startedAt, System.currentTimeMillis())
         } catch (error: Exception) {
             if (running) {
                 listener.onError(error.message ?: "录音处理中断")
             } else {
-                if (commit(currentText)) listener.onSegmentFinalized(committed.toString())
+                if (commit(currentText, joinSamples(segmentAudio, segmentSampleCount))) {
+                    listener.onSegmentFinalized(committed.toString())
+                }
                 listener.onFinished(committed.toString(), startedAt, System.currentTimeMillis())
             }
         } finally {
@@ -208,15 +246,13 @@ class SpeechRecorder(
         fun submitVadSegments() {
             while (!vad.empty() && inferenceError.get() == null) {
                 val segment = vad.front()
-                val start = segment.start
                 val samples = segment.samples
                 vad.pop()
                 val task = Runnable {
                     if (inferenceError.get() != null) return@Runnable
                     try {
                         val text = decodeOffline(recognizer, samples)
-                        val segmentTime = startedAt + (start.toLong() * 1000L / SAMPLE_RATE)
-                        if (commit(text, segmentTime)) {
+                        if (commit(text, samples)) {
                             listener.onSegmentFinalized(committed.toString())
                             listener.onTranscriptChanged(committed.toString())
                         }
@@ -277,21 +313,72 @@ class SpeechRecorder(
         }
     }
 
-    private fun commit(text: String, timestamp: Long = System.currentTimeMillis()): Boolean {
+    private fun commit(text: String, samples: FloatArray): Boolean {
         if (text.isBlank()) return false
+        if (!containsSpeech(samples)) return false
         if (committed.isNotEmpty()) committed.append('\n')
-        committed.append('[').append(formatTime(timestamp)).append("] ").append(text)
+        if (hasOverlappingSpeech(samples)) {
+            committed.append("多人同时说话：")
+        } else {
+            val speaker = assignSpeaker(samples)
+            if (speaker != null) committed.append("说话人").append(speaker).append('：')
+        }
+        committed.append(text)
         return true
     }
 
-    private fun combinedText(partial: String): String {
-        if (partial.isBlank()) return committed.toString()
-        val line = "[${formatTime(System.currentTimeMillis())}] $partial"
+    private fun hasOverlappingSpeech(samples: FloatArray): Boolean {
+        val detector = overlapDetector ?: return false
+        return runCatching { detector.hasOverlap(samples) }.getOrElse {
+            runCatching { detector.release() }
+            overlapDetector = null
+            false
+        }
+    }
+
+    private fun assignSpeaker(samples: FloatArray): Int? {
+        val clusterer = speakerClusterer ?: return null
+        return runCatching { clusterer.assign(samples) }.getOrElse {
+            runCatching { clusterer.release() }
+            speakerClusterer = null
+            null
+        }
+    }
+
+    private fun combinedText(partial: String, hasAudibleSignal: Boolean): String {
+        if (partial.isBlank() || !hasAudibleSignal) return committed.toString()
+        val line = "识别中：$partial"
         return if (committed.isEmpty()) line else "$committed\n$line"
     }
 
-    private fun formatTime(timestamp: Long): String =
-        SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(timestamp))
+    private fun containsSpeech(samples: FloatArray): Boolean {
+        val detector = speechDetector ?: return hasAudibleSignal(samples)
+        return runCatching { detector.hasSpeech(samples) }.getOrElse {
+            runCatching { detector.release() }
+            speechDetector = null
+            hasAudibleSignal(samples)
+        }
+    }
+
+    private fun hasAudibleSignal(samples: FloatArray): Boolean {
+        var squaredSum = 0.0
+        for (sample in samples) squaredSum += sample * sample
+        return hasAudibleSignal(squaredSum, samples.size)
+    }
+
+    private fun hasAudibleSignal(squaredSum: Double, sampleCount: Int): Boolean =
+        sampleCount > 0 && squaredSum / sampleCount >= MIN_AUDIBLE_POWER
+
+    private fun joinSamples(chunks: List<FloatArray>, totalSize: Int): FloatArray {
+        if (totalSize == 0) return FloatArray(0)
+        val result = FloatArray(totalSize)
+        var offset = 0
+        for (chunk in chunks) {
+            chunk.copyInto(result, offset)
+            offset += chunk.size
+        }
+        return result
+    }
 
     private fun createOnlineRecognizer(): OnlineRecognizer {
         val encoder = File(modelDirectory, "encoder.int8.onnx")
@@ -387,5 +474,6 @@ class SpeechRecorder(
         private const val VAD_WINDOW_SIZE = 512
         private const val OFFLINE_QUEUE_CAPACITY = 4
         private const val OFFLINE_SHUTDOWN_TIMEOUT_SECONDS = 120L
+        private const val MIN_AUDIBLE_POWER = 0.000016
     }
 }

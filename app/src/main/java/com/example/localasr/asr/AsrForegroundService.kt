@@ -14,6 +14,7 @@ import com.example.localasr.MainActivity
 import com.example.localasr.R
 import com.example.localasr.history.HistoryDatabase
 import com.example.localasr.model.ModelManager
+import com.example.localasr.model.ModelCatalog
 import com.example.localasr.model.RecognitionMode
 
 class AsrForegroundService : Service(), SpeechRecorderListener {
@@ -50,6 +51,7 @@ class AsrForegroundService : Service(), SpeechRecorderListener {
         if (isActive) return
         isActive = true
         currentTranscript = ""
+        lastSavedSessionId = 0L
         currentStatus = "正在加载模型…"
         recordingStartedAt = 0L
         startForeground(NOTIFICATION_ID, buildNotification(currentStatus))
@@ -69,6 +71,9 @@ class AsrForegroundService : Service(), SpeechRecorderListener {
             context = applicationContext,
             model = model,
             modelDirectory = modelManager.modelDirectory(model),
+            speakerModelDirectory = ModelCatalog.speakerEmbedding
+                .takeIf { modelManager.isInstalled(it) }
+                ?.let { modelManager.modelDirectory(it) },
             listener = this,
         ).also { it.start() }
     }
@@ -110,10 +115,12 @@ class AsrForegroundService : Service(), SpeechRecorderListener {
         currentTranscript = text
         if (text.isBlank()) {
             if (sessionId != 0L) historyDatabase?.delete(sessionId)
+            lastSavedSessionId = 0L
             currentStatus = "已停止，没有识别到文字"
         } else {
             if (sessionId == 0L) sessionId = historyDatabase?.beginSession(startedAt) ?: 0L
             if (sessionId != 0L) historyDatabase?.updateSession(sessionId, endedAt, text)
+            lastSavedSessionId = sessionId
             currentStatus = "已停止并保存到历史记录"
         }
         finishService()
@@ -246,6 +253,14 @@ class AsrForegroundService : Service(), SpeechRecorderListener {
         @Volatile
         var currentStatus: String = ""
             private set
+
+        @Volatile
+        var lastSavedSessionId: Long = 0L
+            private set
+
+        fun updateLastSavedTranscript(sessionId: Long, text: String) {
+            if (!isActive && lastSavedSessionId == sessionId) currentTranscript = text
+        }
 
         private const val CHANNEL_ID = "asr_recording"
         private const val NOTIFICATION_ID = 41
