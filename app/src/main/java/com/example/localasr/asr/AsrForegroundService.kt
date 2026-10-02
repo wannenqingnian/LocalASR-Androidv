@@ -14,6 +14,7 @@ import com.example.localasr.MainActivity
 import com.example.localasr.R
 import com.example.localasr.history.HistoryDatabase
 import com.example.localasr.model.ModelManager
+import com.example.localasr.model.RecognitionMode
 
 class AsrForegroundService : Service(), SpeechRecorderListener {
     private var recorder: SpeechRecorder? = null
@@ -22,6 +23,7 @@ class AsrForegroundService : Service(), SpeechRecorderListener {
     private var wakeLock: PowerManager.WakeLock? = null
     private var lastNotificationUpdate = 0L
     private var recordingStartedAt = 0L
+    private var recognitionMode = RecognitionMode.STREAMING
 
     override fun onCreate() {
         super.onCreate()
@@ -55,15 +57,18 @@ class AsrForegroundService : Service(), SpeechRecorderListener {
         publishState(forceNotification = true)
 
         val modelManager = ModelManager(applicationContext)
-        if (!modelManager.isInstalled()) {
+        val model = modelManager.selectedModel
+        if (!modelManager.isInstalled(model)) {
             finishWithError("模型未安装或校验信息已丢失")
             return
         }
+        recognitionMode = model.mode
 
         historyDatabase = HistoryDatabase(applicationContext)
         recorder = SpeechRecorder(
             context = applicationContext,
-            modelDirectory = modelManager.modelDirectory,
+            model = model,
+            modelDirectory = modelManager.modelDirectory(model),
             listener = this,
         ).also { it.start() }
     }
@@ -81,7 +86,10 @@ class AsrForegroundService : Service(), SpeechRecorderListener {
     override fun onReady(startedAt: Long) {
         recordingStartedAt = startedAt
         sessionId = historyDatabase?.beginSession(startedAt) ?: 0L
-        currentStatus = "正在后台转写"
+        currentStatus = when (recognitionMode) {
+            RecognitionMode.STREAMING -> "正在后台实时转写"
+            RecognitionMode.OFFLINE -> "正在聆听，停顿后显示文字"
+        }
         publishState(forceNotification = true, startedAt = startedAt)
     }
 

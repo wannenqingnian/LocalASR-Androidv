@@ -23,53 +23,67 @@ sealed interface DownloadResult {
 }
 
 class ModelManager(context: Context) {
-    private val root = File(
-        context.getExternalFilesDir("models") ?: File(context.filesDir, "models"),
-        ModelCatalog.streamingParaformer.id,
-    )
+    private val appContext = context.applicationContext
+    private val modelsRoot = appContext.getExternalFilesDir("models")
+        ?: File(appContext.filesDir, "models")
+    private val preferences = appContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
     private val executor = Executors.newSingleThreadExecutor()
     private val pauseRequested = AtomicBoolean(false)
 
-    val modelDirectory: File
-        get() = root
+    val selectedModel: SpeechModel
+        get() = ModelCatalog.find(preferences.getString(KEY_SELECTED_MODEL, null))
 
-    fun isInstalled(): Boolean {
+    val modelDirectory: File
+        get() = modelDirectory(selectedModel)
+
+    fun selectModel(model: SpeechModel) {
+        preferences.edit().putString(KEY_SELECTED_MODEL, model.id).apply()
+    }
+
+    fun modelDirectory(model: SpeechModel): File = File(modelsRoot, model.id)
+
+    fun isInstalled(model: SpeechModel = selectedModel): Boolean {
+        val root = modelDirectory(model)
         if (!File(root, READY_MARKER).isFile) return false
-        return ModelCatalog.streamingParaformer.files.all {
+        return model.files.all {
             val file = File(root, it.localName)
             file.isFile && file.length() == it.size
         }
     }
 
-    fun downloadedBytes(): Long = ModelCatalog.streamingParaformer.files.sumOf { item ->
-        val finalFile = File(root, item.localName)
-        val partFile = File(root, "${item.localName}.part")
-        when {
-            finalFile.isFile -> finalFile.length().coerceAtMost(item.size)
-            partFile.isFile -> partFile.length().coerceAtMost(item.size)
-            else -> 0L
+    fun downloadedBytes(model: SpeechModel = selectedModel): Long {
+        val root = modelDirectory(model)
+        return model.files.sumOf { item ->
+            val finalFile = File(root, item.localName)
+            val partFile = File(root, "${item.localName}.part")
+            when {
+                finalFile.isFile -> finalFile.length().coerceAtMost(item.size)
+                partFile.isFile -> partFile.length().coerceAtMost(item.size)
+                else -> 0L
+            }
         }
     }
 
     fun download(
+        model: SpeechModel = selectedModel,
         source: DownloadSource,
         onProgress: (DownloadProgress) -> Unit,
         onResult: (DownloadResult) -> Unit,
     ) {
         pauseRequested.set(false)
         executor.execute {
+            val root = modelDirectory(model)
             try {
                 root.mkdirs()
                 File(root, READY_MARKER).delete()
-                val model = ModelCatalog.streamingParaformer
                 for (item in model.files) {
                     if (pauseRequested.get()) throw PausedException()
                     val target = File(root, item.localName)
                     if (target.isFile && target.length() == item.size) continue
-                    downloadFile(source, item, target, model.totalBytes, onProgress)
+                    downloadFile(model, source, item, root, target, onProgress)
                 }
                 onProgress(DownloadProgress(model.totalBytes, model.totalBytes, "正在校验模型…"))
-                validateModel(model, onProgress)
+                validateModel(model, root, onProgress)
                 File(root, READY_MARKER).writeText("ok\n")
                 onResult(DownloadResult.Completed)
             } catch (_: PausedException) {
@@ -84,22 +98,24 @@ class ModelManager(context: Context) {
         pauseRequested.set(true)
     }
 
-    fun deleteModel() {
+    fun deleteModel(model: SpeechModel = selectedModel) {
         pause()
+        val root = modelDirectory(model)
         if (root.exists()) root.deleteRecursively()
     }
 
     private fun downloadFile(
+        model: SpeechModel,
         source: DownloadSource,
         item: ModelFile,
+        root: File,
         target: File,
-        totalBytes: Long,
         onProgress: (DownloadProgress) -> Unit,
     ) {
         val part = File(root, "${item.localName}.part")
         if (part.length() > item.size) part.delete()
         var offset = part.length()
-        val connection = URL("${source.baseUrl}/${item.remoteName}").openConnection() as HttpURLConnection
+        val connection = URL(model.downloadUrl(source, item)).openConnection() as HttpURLConnection
         try {
             connection.connectTimeout = 15_000
             connection.readTimeout = 30_000
@@ -129,8 +145,8 @@ class ModelManager(context: Context) {
                         offset += count
                         onProgress(
                             DownloadProgress(
-                                downloadedBytes = completedBytesBefore(item) + offset,
-                                totalBytes = totalBytes,
+                                downloadedBytes = completedBytesBefore(model, root, item) + offset,
+                                totalBytes = model.totalBytes,
                                 message = "${source.displayName} · 正在下载 ${item.localName}",
                             ),
                         )
@@ -147,9 +163,9 @@ class ModelManager(context: Context) {
         }
     }
 
-    private fun completedBytesBefore(current: ModelFile): Long {
+    private fun completedBytesBefore(model: SpeechModel, root: File, current: ModelFile): Long {
         var bytes = 0L
-        for (item in ModelCatalog.streamingParaformer.files) {
+        for (item in model.files) {
             if (item == current) break
             val file = File(root, item.localName)
             if (file.isFile && file.length() == item.size) bytes += item.size
@@ -157,7 +173,7 @@ class ModelManager(context: Context) {
         return bytes
     }
 
-    private fun validateModel(model: SpeechModel, onProgress: (DownloadProgress) -> Unit) {
+    private fun validateModel(model: SpeechModel, root: File, onProgress: (DownloadProgress) -> Unit) {
         model.files.forEachIndexed { index, item ->
             if (pauseRequested.get()) throw PausedException()
             val file = File(root, item.localName)
@@ -194,5 +210,7 @@ class ModelManager(context: Context) {
 
     companion object {
         private const val READY_MARKER = ".ready"
+        private const val PREFERENCES = "settings"
+        private const val KEY_SELECTED_MODEL = "selected_model_id"
     }
 }

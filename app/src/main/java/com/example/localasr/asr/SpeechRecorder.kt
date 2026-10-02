@@ -6,15 +6,30 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import com.example.localasr.model.RecognitionMode
+import com.example.localasr.model.SpeechModel
 import com.k2fsa.sherpa.onnx.EndpointConfig
 import com.k2fsa.sherpa.onnx.EndpointRule
 import com.k2fsa.sherpa.onnx.FeatureConfig
+import com.k2fsa.sherpa.onnx.OfflineModelConfig
+import com.k2fsa.sherpa.onnx.OfflineParaformerModelConfig
+import com.k2fsa.sherpa.onnx.OfflineRecognizer
+import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
 import com.k2fsa.sherpa.onnx.OnlineModelConfig
 import com.k2fsa.sherpa.onnx.OnlineParaformerModelConfig
 import com.k2fsa.sherpa.onnx.OnlineRecognizer
 import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
+import com.k2fsa.sherpa.onnx.SileroVadModelConfig
+import com.k2fsa.sherpa.onnx.Vad
+import com.k2fsa.sherpa.onnx.VadModelConfig
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 interface SpeechRecorderListener {
@@ -27,6 +42,7 @@ interface SpeechRecorderListener {
 
 class SpeechRecorder(
     private val context: Context,
+    private val model: SpeechModel,
     private val modelDirectory: File,
     private val listener: SpeechRecorderListener,
 ) {
@@ -42,20 +58,10 @@ class SpeechRecorder(
         running = true
         worker = thread(name = "asr-recorder") {
             try {
-                val recognizer = createRecognizer()
-                if (!running) {
-                    recognizer.release()
-                    val cancelledAt = System.currentTimeMillis()
-                    listener.onFinished("", cancelledAt, cancelledAt)
-                    return@thread
+                when (model.mode) {
+                    RecognitionMode.STREAMING -> startStreaming()
+                    RecognitionMode.OFFLINE -> startOffline()
                 }
-                val recorder = createAudioRecord()
-                audioRecord = recorder
-                committed.clear()
-                startedAt = System.currentTimeMillis()
-                recorder.startRecording()
-                listener.onReady(startedAt)
-                recognize(recognizer, recorder)
             } catch (error: Exception) {
                 running = false
                 releaseRecorder()
@@ -75,7 +81,62 @@ class SpeechRecorder(
 
     fun isRunning(): Boolean = running
 
-    private fun recognize(recognizer: OnlineRecognizer, recorder: AudioRecord) {
+    private fun startStreaming() {
+        val recognizer = createOnlineRecognizer()
+        if (!running) {
+            recognizer.release()
+            finishCancelled()
+            return
+        }
+        val recorder = try {
+            beginRecording()
+        } catch (error: Exception) {
+            recognizer.release()
+            throw error
+        }
+        recognizeStreaming(recognizer, recorder)
+    }
+
+    private fun startOffline() {
+        val recognizer = createOfflineRecognizer()
+        val vad = try {
+            createVad()
+        } catch (error: Exception) {
+            recognizer.release()
+            throw error
+        }
+        if (!running) {
+            vad.release()
+            recognizer.release()
+            finishCancelled()
+            return
+        }
+        val recorder = try {
+            beginRecording()
+        } catch (error: Exception) {
+            vad.release()
+            recognizer.release()
+            throw error
+        }
+        recognizeOffline(recognizer, vad, recorder)
+    }
+
+    private fun beginRecording(): AudioRecord {
+        val recorder = createAudioRecord()
+        audioRecord = recorder
+        committed.clear()
+        startedAt = System.currentTimeMillis()
+        recorder.startRecording()
+        listener.onReady(startedAt)
+        return recorder
+    }
+
+    private fun finishCancelled() {
+        val cancelledAt = System.currentTimeMillis()
+        listener.onFinished("", cancelledAt, cancelledAt)
+    }
+
+    private fun recognizeStreaming(recognizer: OnlineRecognizer, recorder: AudioRecord) {
         val stream = recognizer.createStream()
         val buffer = ShortArray(SAMPLE_RATE / 10)
         var currentText = ""
@@ -127,25 +188,112 @@ class SpeechRecorder(
         }
     }
 
-    private fun commit(text: String): Boolean {
+    private fun recognizeOffline(recognizer: OfflineRecognizer, vad: Vad, recorder: AudioRecord) {
+        val inferenceError = AtomicReference<Throwable?>(null)
+        val inferenceQueue = ArrayBlockingQueue<Runnable>(OFFLINE_QUEUE_CAPACITY)
+        val inference = ThreadPoolExecutor(
+            1,
+            1,
+            0L,
+            TimeUnit.MILLISECONDS,
+            inferenceQueue,
+        ).apply {
+            rejectedExecutionHandler = java.util.concurrent.RejectedExecutionHandler { task, executor ->
+                if (!executor.isShutdown) inferenceQueue.put(task)
+            }
+        }
+        val buffer = ShortArray(VAD_WINDOW_SIZE)
+        var recordingError: Throwable? = null
+
+        fun submitVadSegments() {
+            while (!vad.empty() && inferenceError.get() == null) {
+                val segment = vad.front()
+                val start = segment.start
+                val samples = segment.samples
+                vad.pop()
+                val task = Runnable {
+                    if (inferenceError.get() != null) return@Runnable
+                    try {
+                        val text = decodeOffline(recognizer, samples)
+                        val segmentTime = startedAt + (start.toLong() * 1000L / SAMPLE_RATE)
+                        if (commit(text, segmentTime)) {
+                            listener.onSegmentFinalized(committed.toString())
+                            listener.onTranscriptChanged(committed.toString())
+                        }
+                    } catch (error: Throwable) {
+                        inferenceError.compareAndSet(null, error)
+                        running = false
+                        try {
+                            recorder.stop()
+                        } catch (_: IllegalStateException) {
+                            // The recording loop may already be stopping.
+                        }
+                    }
+                }
+                if (inferenceError.get() == null) inference.execute(task)
+            }
+        }
+
+        try {
+            while (running && inferenceError.get() == null) {
+                val count = recorder.read(buffer, 0, buffer.size)
+                if (count <= 0) continue
+                vad.acceptWaveform(FloatArray(count) { buffer[it] / 32768.0f })
+                submitVadSegments()
+            }
+        } catch (error: Throwable) {
+            if (running && inferenceError.get() == null) recordingError = error
+        } finally {
+            if (inferenceError.get() == null && recordingError == null) {
+                vad.flush()
+                submitVadSegments()
+            }
+            inference.shutdown()
+            if (!inference.awaitTermination(OFFLINE_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                inference.shutdownNow()
+                recordingError = IllegalStateException("最后一段识别超时")
+            }
+            val error = inferenceError.get() ?: recordingError
+            if (error == null) {
+                listener.onFinished(committed.toString(), startedAt, System.currentTimeMillis())
+            } else {
+                listener.onError(error.message ?: "分段识别中断")
+            }
+            running = false
+            releaseRecorder()
+            vad.release()
+            recognizer.release()
+        }
+    }
+
+    private fun decodeOffline(recognizer: OfflineRecognizer, samples: FloatArray): String {
+        val stream = recognizer.createStream()
+        return try {
+            stream.acceptWaveform(samples, SAMPLE_RATE)
+            recognizer.decode(stream)
+            recognizer.getResult(stream).text.trim()
+        } finally {
+            stream.release()
+        }
+    }
+
+    private fun commit(text: String, timestamp: Long = System.currentTimeMillis()): Boolean {
         if (text.isBlank()) return false
         if (committed.isNotEmpty()) committed.append('\n')
-        committed.append('[').append(elapsed()).append("] ").append(text)
+        committed.append('[').append(formatTime(timestamp)).append("] ").append(text)
         return true
     }
 
     private fun combinedText(partial: String): String {
         if (partial.isBlank()) return committed.toString()
-        val line = "[${elapsed()}] $partial"
+        val line = "[${formatTime(System.currentTimeMillis())}] $partial"
         return if (committed.isEmpty()) line else "$committed\n$line"
     }
 
-    private fun elapsed(): String {
-        val seconds = ((System.currentTimeMillis() - startedAt) / 1000L).coerceAtLeast(0L)
-        return String.format(Locale.ROOT, "%02d:%02d", seconds / 60, seconds % 60)
-    }
+    private fun formatTime(timestamp: Long): String =
+        SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(timestamp))
 
-    private fun createRecognizer(): OnlineRecognizer {
+    private fun createOnlineRecognizer(): OnlineRecognizer {
         val encoder = File(modelDirectory, "encoder.int8.onnx")
         val decoder = File(modelDirectory, "decoder.int8.onnx")
         val tokens = File(modelDirectory, "tokens.txt")
@@ -168,6 +316,37 @@ class SpeechRecorder(
             enableEndpoint = true,
         )
         return OnlineRecognizer(assetManager = null, config = config)
+    }
+
+    private fun createOfflineRecognizer(): OfflineRecognizer {
+        val config = OfflineRecognizerConfig(
+            featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
+            modelConfig = OfflineModelConfig(
+                paraformer = OfflineParaformerModelConfig(
+                    model = File(modelDirectory, "model.int8.onnx").absolutePath,
+                ),
+                tokens = File(modelDirectory, "tokens.txt").absolutePath,
+                numThreads = 2,
+                modelType = "paraformer",
+            ),
+        )
+        return OfflineRecognizer(assetManager = null, config = config)
+    }
+
+    private fun createVad(): Vad {
+        val config = VadModelConfig(
+            sileroVadModelConfig = SileroVadModelConfig(
+                model = File(modelDirectory, "silero_vad.int8.onnx").absolutePath,
+                threshold = 0.5f,
+                minSilenceDuration = 0.8f,
+                minSpeechDuration = 0.25f,
+                windowSize = VAD_WINDOW_SIZE,
+                maxSpeechDuration = 15f,
+            ),
+            sampleRate = SAMPLE_RATE,
+            numThreads = 1,
+        )
+        return Vad(assetManager = null, config = config)
     }
 
     private fun createAudioRecord(): AudioRecord {
@@ -205,5 +384,8 @@ class SpeechRecorder(
 
     companion object {
         private const val SAMPLE_RATE = 16_000
+        private const val VAD_WINDOW_SIZE = 512
+        private const val OFFLINE_QUEUE_CAPACITY = 4
+        private const val OFFLINE_SHUTDOWN_TIMEOUT_SECONDS = 120L
     }
 }
