@@ -20,6 +20,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Build
 import android.os.PowerManager
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.text.Editable
 import android.text.InputType
@@ -73,15 +74,18 @@ class MainActivity : Activity() {
     private var lastTranscript = ""
     private var pendingExportText = ""
     private var pendingRecordPermission = false
+    private var pendingImportModelId: String? = null
 
     private var downloading = false
+    private var downloadingModel: SpeechModel? = null
+    private var importingModel = false
     private var selectedSource = DownloadSource.DOMESTIC
     private var drawerOpen = false
-    private var modelProgress: ProgressBar? = null
-    private var modelStatus: TextView? = null
-    private var modelActionButton: Button? = null
-    private var modelDeleteButton: Button? = null
-    private var modelChoiceButtons: List<RadioButton> = emptyList()
+    private val modelProgressViews = mutableMapOf<String, ProgressBar>()
+    private val modelStatusViews = mutableMapOf<String, TextView>()
+    private val modelActionButtons = mutableMapOf<String, Button>()
+    private val modelImportButtons = mutableMapOf<String, TextView>()
+    private val modelDeleteButtons = mutableMapOf<String, Button>()
     private var stateReceiverRegistered = false
     private var currentPage = Page.TRANSCRIBE
     private val navItems = mutableMapOf<Page, TextView>()
@@ -176,17 +180,25 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != REQUEST_EXPORT_TEXT || resultCode != RESULT_OK) return
-        val target = data?.data ?: return
-        runCatching {
-            contentResolver.openOutputStream(target)?.bufferedWriter(Charsets.UTF_8).use { writer ->
-                checkNotNull(writer) { "无法创建导出文件" }
-                writer.write(pendingExportText)
+        if (resultCode != RESULT_OK) {
+            if (requestCode == REQUEST_IMPORT_MODEL) pendingImportModelId = null
+            return
+        }
+        when (requestCode) {
+            REQUEST_EXPORT_TEXT -> {
+                val target = data?.data ?: return
+                runCatching {
+                    contentResolver.openOutputStream(target)?.bufferedWriter(Charsets.UTF_8).use { writer ->
+                        checkNotNull(writer) { "无法创建导出文件" }
+                        writer.write(pendingExportText)
+                    }
+                }.onSuccess {
+                    showMessage("转写文本已导出")
+                }.onFailure {
+                    showMessage("导出失败：${it.message ?: "无法写入文件"}")
+                }
             }
-        }.onSuccess {
-            showMessage("转写文本已导出")
-        }.onFailure {
-            showMessage("导出失败：${it.message ?: "无法写入文件"}")
+            REQUEST_IMPORT_MODEL -> handleModelImportResult(data)
         }
     }
 
@@ -342,7 +354,7 @@ class MainActivity : Activity() {
         setPage(
             Page.TRANSCRIBE,
             if (isOffline) "川渝方言分段转写" else "实时语音转文字",
-            "当前：${selectedModel.name} · 音频不会上传",
+            "音频只在本机处理",
         )
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -375,6 +387,31 @@ class MainActivity : Activity() {
         statusTexts.addView(recordingDetail, topMargin(2))
         statusCard.addView(statusTexts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         page.addView(statusCard, matchWrap().apply { bottomMargin = dp(12) })
+
+        val modelSwitchCard = horizontalCard().apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(12), dp(14), dp(12))
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { showModelPicker() }
+        }
+        val modelSwitchTexts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        modelSwitchTexts.addView(label("识别模型 · 点击切换", 12f, false, COLOR_MUTED), matchWrap())
+        modelSwitchTexts.addView(label(selectedModel.name, 15f, true), topMargin(2))
+        modelSwitchCard.addView(
+            modelSwitchTexts,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        val modelReady = modelManager.isInstalled(selectedModel)
+        modelSwitchCard.addView(
+            chip(
+                if (modelReady) "已就绪" else modelInstallState(selectedModel),
+                if (modelReady) COLOR_SUCCESS else COLOR_WARNING,
+                if (modelReady) COLOR_SUCCESS_SOFT else COLOR_WARNING_SOFT,
+            ),
+            wrapWrap().apply { leftMargin = dp(8) },
+        )
+        page.addView(modelSwitchCard, matchWrap().apply { bottomMargin = dp(12) })
 
         val transcriptCard = verticalCard().apply {
             setPadding(dp(18), dp(16), dp(18), dp(18))
@@ -453,6 +490,47 @@ class MainActivity : Activity() {
         page.addView(recordButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56)))
         replaceContent(page)
         syncRecordingUi()
+    }
+
+    private fun showModelPicker() {
+        if (downloading || AsrForegroundService.isActive) {
+            showMessage("请先暂停下载或停止当前转写")
+            return
+        }
+        val models = ModelCatalog.models
+        val currentIndex = models.indexOfFirst { it.id == modelManager.selectedModel.id }
+        val labels = models.map { model ->
+            "${model.name} · ${modelInstallState(model)}\n${model.description}"
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("切换识别模型")
+            .setSingleChoiceItems(labels, currentIndex) { dialog, which ->
+                val selected = models[which]
+                dialog.dismiss()
+                if (!modelManager.isInstalled(selected)) {
+                    AlertDialog.Builder(this)
+                        .setTitle("模型尚未下载")
+                        .setMessage("请先在模型管理中下载“${selected.name}”，下载完成后即可在这里切换。")
+                        .setNegativeButton("取消", null)
+                        .setPositiveButton("去下载") { _, _ -> showModels() }
+                        .show()
+                    return@setSingleChoiceItems
+                }
+                if (selected.id == modelManager.selectedModel.id) return@setSingleChoiceItems
+                modelManager.selectModel(selected)
+                showMessage("已切换到“${selected.name}”")
+                showTranscribe()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun modelInstallState(model: SpeechModel): String {
+        if (modelManager.isInstalled(model)) return "已安装"
+        val downloaded = modelManager.downloadedBytes(model)
+        if (downloaded <= 0L) return "未安装"
+        val percent = ((downloaded * 100L) / model.totalBytes).toInt().coerceIn(1, 99)
+        return "已下载 $percent%"
     }
 
     private fun requestRecording() {
@@ -554,9 +632,7 @@ class MainActivity : Activity() {
                 16f,
             )
         }
-        modelDeleteButton?.isEnabled =
-            !downloading && !AsrForegroundService.isActive && modelManager.downloadedBytes() > 0L
-        modelChoiceButtons.forEach { it.isEnabled = !downloading && !AsrForegroundService.isActive }
+        if (currentPage == Page.MODELS) refreshModelUi()
     }
 
     private fun transcriptText(): String = transcriptView?.text?.toString()?.trim().orEmpty()
@@ -607,13 +683,17 @@ class MainActivity : Activity() {
     }
 
     private fun showModels() {
-        setPage(Page.MODELS, "模型管理", "按需下载，支持暂停和断点续传")
-        val model = modelManager.selectedModel
+        setPage(Page.MODELS, "模型管理", "下载、导入或删除本地模型")
+        modelProgressViews.clear()
+        modelStatusViews.clear()
+        modelActionButtons.clear()
+        modelImportButtons.clear()
+        modelDeleteButtons.clear()
+
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(6), dp(16), dp(24))
         }
-
         val privacyCard = horizontalCard().apply {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(13), dp(16), dp(13))
@@ -621,165 +701,181 @@ class MainActivity : Activity() {
         }
         privacyCard.addView(label("✓", 18f, true, COLOR_PRIMARY), LinearLayout.LayoutParams(dp(28), dp(32)))
         privacyCard.addView(
-            label("APK 不内置模型，下载完成后可完全离线使用", 13f, false, COLOR_PRIMARY),
+            label("模型仅保存在本机；当前识别模型请在主界面切换", 13f, false, COLOR_PRIMARY),
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
         )
         body.addView(privacyCard, matchWrap().apply { bottomMargin = dp(12) })
 
-        val selectorCard = verticalCard().apply {
-            setPadding(dp(18), dp(16), dp(18), dp(12))
+        body.addView(downloadSourceCard(), matchWrap().apply { bottomMargin = dp(16) })
+        val installedCount = ModelCatalog.models.count { modelManager.isInstalled(it) }
+        val modelsHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
         }
-        selectorCard.addView(label("选择识别模型", 15f, true), matchWrap())
-        selectorCard.addView(
-            label("只会加载当前选中的模型；下载多个模型不会叠加运行内存。", 12f, false, COLOR_MUTED),
+        modelsHeader.addView(
+            label("模型文件", 17f, true),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        modelsHeader.addView(
+            chip("已安装 $installedCount/${ModelCatalog.models.size}", COLOR_PRIMARY, COLOR_PRIMARY_SOFT),
+            wrapWrap(),
+        )
+        body.addView(modelsHeader, matchWrap().apply { bottomMargin = dp(10) })
+        ModelCatalog.models.forEach { model ->
+            body.addView(modelManagementCard(model), matchWrap().apply { bottomMargin = dp(12) })
+        }
+        body.addView(
+            label(
+                "下载支持暂停和断点续传；本地导入需一次选择该模型所需的全部文件。两种方式都会执行大小与 SHA-256 校验。",
+                13f,
+                false,
+                COLOR_MUTED,
+            ).apply { setLineSpacing(dp(3).toFloat(), 1f) },
             topMargin(4),
         )
-        val modelChoices = RadioGroup(this).apply {
-            orientation = RadioGroup.VERTICAL
-            setPadding(0, dp(7), 0, 0)
-        }
-        val choiceModels = mutableMapOf<Int, SpeechModel>()
-        val choices = mutableListOf<RadioButton>()
-        ModelCatalog.models.forEach { candidate ->
-            val choice = RadioButton(this).apply {
-                id = View.generateViewId()
-                text = "${candidate.name}\n${candidate.description}"
-                textSize = 14f
-                setLineSpacing(dp(2).toFloat(), 1f)
-                setTextColor(COLOR_TEXT)
-                buttonTintList = ColorStateList.valueOf(COLOR_PRIMARY)
-                isChecked = candidate.id == model.id
-                isEnabled = !downloading && !AsrForegroundService.isActive
-                setPadding(0, dp(4), 0, dp(4))
-            }
-            choices += choice
-            choiceModels[choice.id] = candidate
-            modelChoices.addView(choice, matchWrap())
-        }
-        modelChoiceButtons = choices
-        modelChoices.setOnCheckedChangeListener { _, checkedId ->
-            val selected = choiceModels[checkedId] ?: return@setOnCheckedChangeListener
-            if (downloading || AsrForegroundService.isActive) {
-                showMessage("请先暂停下载或停止当前转写")
-                showModels()
-                return@setOnCheckedChangeListener
-            }
-            if (selected.id != modelManager.selectedModel.id) {
-                modelManager.selectModel(selected)
-                showModels()
-            }
-        }
-        selectorCard.addView(modelChoices, matchWrap())
-        body.addView(selectorCard, matchWrap().apply { bottomMargin = dp(12) })
 
-        val modelCard = verticalCard().apply {
-            setPadding(dp(18), dp(18), dp(18), dp(18))
-        }
-        val titleRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.TOP
-        }
-        val titleTexts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        titleTexts.addView(label(model.name, 18f, true), matchWrap())
-        titleTexts.addView(label(model.description, 13f, false, COLOR_MUTED), topMargin(5))
-        titleRow.addView(titleTexts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        titleRow.addView(
-            chip(
-                if (model.mode == RecognitionMode.OFFLINE) "停顿后输出" else "实时",
-                COLOR_PRIMARY,
-                COLOR_PRIMARY_SOFT,
-            ),
-            wrapWrap().apply { leftMargin = dp(8) },
-        )
-        modelCard.addView(titleRow, matchWrap())
+        replaceContent(ScrollView(this).apply { addView(body) })
+        refreshModelUi()
+    }
 
-        modelCard.addView(divider(), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(1),
-        ).apply {
-            topMargin = dp(18)
-            bottomMargin = dp(16)
-        })
-        modelCard.addView(label("选择下载源", 14f, true), matchWrap())
-        val sources = RadioGroup(this).apply {
-            orientation = RadioGroup.VERTICAL
+    private fun downloadSourceCard(): View = verticalCard().apply {
+        setPadding(dp(18), dp(15), dp(18), dp(12))
+        addView(label("下载线路", 15f, true), matchWrap())
+        addView(label("线路只影响在线下载，本地导入不受影响。", 12f, false, COLOR_MUTED), topMargin(3))
+        val sources = RadioGroup(this@MainActivity).apply {
+            orientation = RadioGroup.HORIZONTAL
             setPadding(0, dp(6), 0, 0)
         }
-        val domestic = RadioButton(this).apply {
+        val domestic = RadioButton(this@MainActivity).apply {
             id = View.generateViewId()
-            text = "国内镜像   hf-mirror.com"
+            text = "国内镜像"
             textSize = 14f
             setTextColor(COLOR_TEXT)
             buttonTintList = ColorStateList.valueOf(COLOR_PRIMARY)
             isChecked = selectedSource == DownloadSource.DOMESTIC
         }
-        val official = RadioButton(this).apply {
+        val official = RadioButton(this@MainActivity).apply {
             id = View.generateViewId()
-            text = "官方原站   huggingface.co"
+            text = "官方原站"
             textSize = 14f
             setTextColor(COLOR_TEXT)
             buttonTintList = ColorStateList.valueOf(COLOR_PRIMARY)
             isChecked = selectedSource == DownloadSource.OFFICIAL
         }
-        sources.addView(domestic)
-        sources.addView(official)
+        sources.addView(domestic, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        sources.addView(official, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         sources.setOnCheckedChangeListener { _, checkedId ->
             selectedSource = if (checkedId == official.id) DownloadSource.OFFICIAL else DownloadSource.DOMESTIC
             getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
                 .putString(KEY_SOURCE, selectedSource.name)
                 .apply()
         }
-        modelCard.addView(sources, matchWrap())
-        if (model.mode == RecognitionMode.OFFLINE) {
-            modelCard.addView(
-                label("川渝语音模型按所选线路下载；约 208 KB 的分段检测文件来自 sherpa-onnx 官方发布页。", 12f, false, COLOR_MUTED),
-                topMargin(4),
-            )
-        }
+        addView(sources, matchWrap())
+    }
 
-        modelProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+    private fun modelManagementCard(model: SpeechModel): View = verticalCard().apply {
+        setPadding(dp(18), dp(17), dp(18), dp(18))
+        val titleRow = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.TOP
+        }
+        val titleTexts = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+        titleTexts.addView(label(model.name, 17f, true), matchWrap())
+        titleTexts.addView(label(model.description, 13f, false, COLOR_MUTED), topMargin(4))
+        titleRow.addView(titleTexts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        titleRow.addView(
+            chip(
+                if (model.mode == RecognitionMode.OFFLINE) "分段识别" else "实时识别",
+                COLOR_PRIMARY,
+                COLOR_PRIMARY_SOFT,
+            ),
+            wrapWrap().apply { leftMargin = dp(8) },
+        )
+        addView(titleRow, matchWrap())
+
+        val progress = ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 1000
             progressTintList = ColorStateList.valueOf(COLOR_PRIMARY)
             progressBackgroundTintList = ColorStateList.valueOf(COLOR_BORDER)
         }
-        modelCard.addView(modelProgress, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(8)).apply {
-            topMargin = dp(18)
+        modelProgressViews[model.id] = progress
+        addView(progress, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(8)).apply {
+            topMargin = dp(16)
         })
-        modelStatus = label("", 14f, false, COLOR_MUTED)
-        modelCard.addView(modelStatus, topMargin(9))
+        val status = label("", 13f, false, COLOR_MUTED)
+        modelStatusViews[model.id] = status
+        addView(status, topMargin(8))
 
-        modelActionButton = primaryButton("下载模型").apply {
-            setOnClickListener {
-                if (downloading) pauseDownload() else startDownload()
-            }
+        addView(label("模型地址", 13f, true), topMargin(15))
+        val domesticUrl = modelRepositoryUrl(DownloadSource.DOMESTIC, model)
+        val officialUrl = modelRepositoryUrl(DownloadSource.OFFICIAL, model)
+        addView(selectableAddress("国内：$domesticUrl"), topMargin(5))
+        addView(selectableAddress("官方：$officialUrl"), topMargin(4))
+        val copyActions = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
         }
-        modelCard.addView(modelActionButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)).apply {
-            topMargin = dp(18)
+        copyActions.addView(textAction("复制国内地址") { copyModelUrl(domesticUrl) }, weightedAction())
+        copyActions.addView(textAction("复制官方地址") { copyModelUrl(officialUrl) }, weightedAction().apply {
+            leftMargin = dp(8)
         })
-        modelDeleteButton = dangerButton("删除本地模型").apply {
-            setOnClickListener { confirmDeleteModel() }
-        }
-        modelCard.addView(modelDeleteButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)).apply {
+        addView(copyActions, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)).apply {
             topMargin = dp(8)
         })
-        body.addView(modelCard, matchWrap())
-
-        body.addView(label("下载说明", 14f, true), topMargin(18))
-        body.addView(
-            label("下载中断后会保留已完成部分。再次点击继续时，只获取剩余内容；完成后自动执行 SHA-256 校验。", 13f, false, COLOR_MUTED).apply {
-                setLineSpacing(dp(3).toFloat(), 1f)
-            },
-            topMargin(6),
+        addView(
+            label(
+                "本地文件：${model.files.joinToString("、") { it.remoteName }}",
+                12f,
+                false,
+                COLOR_MUTED,
+            ),
+            topMargin(10),
         )
 
-        val scroll = ScrollView(this).apply { addView(body) }
-        replaceContent(scroll)
-        refreshModelUi()
+        val downloadButton = primaryButton("下载模型").apply {
+            setOnClickListener {
+                if (downloading && downloadingModel?.id == model.id) pauseDownload() else startDownload(model)
+            }
+        }
+        modelActionButtons[model.id] = downloadButton
+        addView(downloadButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50)).apply {
+            topMargin = dp(15)
+        })
+        val importButton = textAction("从本地导入模型文件") { requestModelImport(model) }
+        modelImportButtons[model.id] = importButton
+        addView(importButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)).apply {
+            topMargin = dp(8)
+        })
+        val deleteButton = dangerButton("删除本地模型").apply {
+            setOnClickListener { confirmDeleteModel(model) }
+        }
+        modelDeleteButtons[model.id] = deleteButton
+        addView(deleteButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)).apply {
+            topMargin = dp(8)
+        })
     }
 
-    private fun startDownload() {
-        val model = modelManager.selectedModel
+    private fun selectableAddress(text: String) = label(text, 11f, false, COLOR_MUTED).apply {
+        setTextIsSelectable(true)
+    }
+
+    private fun modelRepositoryUrl(source: DownloadSource, model: SpeechModel): String =
+        "${source.huggingFaceHost}/${model.repository}"
+
+    private fun copyModelUrl(url: String) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("模型地址", url))
+        showMessage("模型地址已复制")
+    }
+
+    private fun startDownload(model: SpeechModel) {
+        if (downloading || AsrForegroundService.isActive) {
+            showMessage("请先暂停当前任务或停止转写")
+            return
+        }
         downloading = true
+        downloadingModel = model
+        importingModel = false
         refreshModelUi()
         modelManager.download(
             model = model,
@@ -788,8 +884,9 @@ class MainActivity : Activity() {
             onResult = { result ->
                 runOnUiThread {
                     downloading = false
+                    downloadingModel = null
                     when (result) {
-                        DownloadResult.Completed -> showMessage("模型下载并校验完成")
+                        DownloadResult.Completed -> showMessage("${model.name}下载并校验完成")
                         DownloadResult.Paused -> showMessage("已暂停，可随时继续")
                         is DownloadResult.Failed -> showMessage(result.message)
                     }
@@ -799,57 +896,128 @@ class MainActivity : Activity() {
         )
     }
 
+    private fun requestModelImport(model: SpeechModel) {
+        if (downloading || AsrForegroundService.isActive) {
+            showMessage("请先暂停当前任务或停止转写")
+            return
+        }
+        pendingImportModelId = model.id
+        startActivityForResult(
+            Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+                putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            },
+            REQUEST_IMPORT_MODEL,
+        )
+    }
+
+    private fun handleModelImportResult(data: Intent?) {
+        val modelId = pendingImportModelId ?: return
+        val model = ModelCatalog.find(modelId)
+        pendingImportModelId = null
+        val uris = buildList {
+            data?.clipData?.let { clips ->
+                for (index in 0 until clips.itemCount) add(clips.getItemAt(index).uri)
+            }
+            data?.data?.let { if (it !in this) add(it) }
+        }
+        if (uris.isEmpty()) {
+            showMessage("没有选择模型文件")
+            return
+        }
+        val filesByName = uris.associateBy { documentDisplayName(it) }
+        downloading = true
+        downloadingModel = model
+        importingModel = true
+        refreshModelUi()
+        modelManager.importModel(
+            model = model,
+            filesByName = filesByName,
+            onProgress = { progress -> runOnUiThread { renderDownloadProgress(progress) } },
+            onResult = { result ->
+                runOnUiThread {
+                    downloading = false
+                    downloadingModel = null
+                    importingModel = false
+                    when (result) {
+                        DownloadResult.Completed -> showMessage("${model.name}导入并校验完成")
+                        DownloadResult.Paused -> showMessage("已暂停导入")
+                        is DownloadResult.Failed -> showMessage("导入失败：${result.message}")
+                    }
+                    refreshModelUi()
+                }
+            },
+        )
+    }
+
+    private fun documentDisplayName(uri: Uri): String {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) return cursor.getString(0)
+        }
+        return uri.lastPathSegment.orEmpty().substringAfterLast('/')
+    }
+
     private fun pauseDownload() {
-        modelActionButton?.isEnabled = false
-        modelStatus?.text = "正在暂停…"
+        val modelId = downloadingModel?.id ?: return
+        modelActionButtons[modelId]?.isEnabled = false
+        modelStatusViews[modelId]?.text = "正在暂停…"
         modelManager.pause()
     }
 
     private fun renderDownloadProgress(progress: DownloadProgress) {
+        val modelId = downloadingModel?.id ?: return
         val ratio = if (progress.totalBytes == 0L) 0 else {
             ((progress.downloadedBytes * 1000L) / progress.totalBytes).toInt().coerceIn(0, 1000)
         }
-        modelProgress?.progress = ratio
-        modelStatus?.text = "${progress.message}\n${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)}"
+        modelProgressViews[modelId]?.progress = ratio
+        modelStatusViews[modelId]?.text =
+            "${progress.message}\n${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)}"
     }
 
     private fun refreshModelUi() {
-        val model = modelManager.selectedModel
-        val installed = modelManager.isInstalled(model)
-        val downloaded = modelManager.downloadedBytes(model)
-        modelProgress?.progress = ((downloaded * 1000L) / model.totalBytes).toInt().coerceIn(0, 1000)
-        modelStatus?.text = when {
-            installed -> "已安装并校验 · ${formatBytes(model.totalBytes)}"
-            downloaded > 0L -> "可继续下载 · ${formatBytes(downloaded)} / ${formatBytes(model.totalBytes)}"
-            else -> "未安装 · 需要下载 ${formatBytes(model.totalBytes)}"
-        }
-        modelActionButton?.apply {
-            text = when {
-                downloading -> "暂停下载"
-                installed -> "重新校验 / 下载"
-                downloaded > 0L -> "继续下载"
-                else -> "下载模型"
+        ModelCatalog.models.forEach { model ->
+            val installed = modelManager.isInstalled(model)
+            val downloaded = modelManager.downloadedBytes(model)
+            val isActive = downloading && downloadingModel?.id == model.id
+            modelProgressViews[model.id]?.progress =
+                ((downloaded * 1000L) / model.totalBytes).toInt().coerceIn(0, 1000)
+            modelStatusViews[model.id]?.text = when {
+                isActive && importingModel -> "正在准备导入…"
+                isActive -> "正在连接下载线路…"
+                installed -> "已安装并校验 · ${formatBytes(model.totalBytes)}"
+                downloaded > 0L -> "可继续下载 · ${formatBytes(downloaded)} / ${formatBytes(model.totalBytes)}"
+                else -> "未安装 · 需要 ${formatBytes(model.totalBytes)}"
             }
-            isEnabled = true
+            modelActionButtons[model.id]?.apply {
+                text = when {
+                    isActive && importingModel -> "暂停导入"
+                    isActive -> "暂停下载"
+                    installed -> "重新校验模型"
+                    downloaded > 0L -> "继续下载"
+                    else -> "下载模型"
+                }
+                isEnabled = !AsrForegroundService.isActive && (!downloading || isActive)
+            }
+            modelImportButtons[model.id]?.isEnabled = !downloading && !AsrForegroundService.isActive
+            modelDeleteButtons[model.id]?.isEnabled =
+                !downloading && !AsrForegroundService.isActive && downloaded > 0L
         }
-        modelDeleteButton?.isEnabled = !downloading && !AsrForegroundService.isActive && downloaded > 0L
-        modelChoiceButtons.forEach { it.isEnabled = !downloading && !AsrForegroundService.isActive }
     }
 
-    private fun confirmDeleteModel() {
+    private fun confirmDeleteModel(model: SpeechModel) {
         if (downloading) return
         if (AsrForegroundService.isActive) {
             showMessage("请先停止当前转写，再删除模型")
             return
         }
-        val model = modelManager.selectedModel
         AlertDialog.Builder(this)
             .setTitle("删除本地模型？")
-            .setMessage("将删除“${model.name}”。历史文字仍会保留，但再次使用这个模型前需要重新下载。")
+            .setMessage("将删除“${model.name}”。历史文字仍会保留，再次使用前需要重新下载或导入。")
             .setNegativeButton("取消", null)
             .setPositiveButton("删除") { _, _ ->
                 modelManager.deleteModel(model)
-                refreshModelUi()
+                showModels()
             }
             .show()
     }
@@ -1305,6 +1473,7 @@ class MainActivity : Activity() {
         private const val REQUEST_RECORD_AUDIO = 200
         private const val REQUEST_EXPORT_TEXT = 201
         private const val REQUEST_NOTIFICATION_PERMISSION = 202
+        private const val REQUEST_IMPORT_MODEL = 203
         private const val PREFERENCES = "settings"
         private const val KEY_SOURCE = "download_source"
         private val COLOR_BACKGROUND = 0xFFF6F8FC.toInt()

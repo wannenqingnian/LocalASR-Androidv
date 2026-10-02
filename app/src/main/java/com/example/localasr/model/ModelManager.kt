@@ -1,6 +1,7 @@
 package com.example.localasr.model
 
 import android.content.Context
+import android.net.Uri
 import java.io.File
 import java.io.FileInputStream
 import java.io.RandomAccessFile
@@ -90,6 +91,79 @@ class ModelManager(context: Context) {
                 onResult(DownloadResult.Paused)
             } catch (error: Exception) {
                 onResult(DownloadResult.Failed(error.message ?: "下载失败"))
+            }
+        }
+    }
+
+    fun importModel(
+        model: SpeechModel,
+        filesByName: Map<String, Uri>,
+        onProgress: (DownloadProgress) -> Unit,
+        onResult: (DownloadResult) -> Unit,
+    ) {
+        pauseRequested.set(false)
+        executor.execute {
+            val root = modelDirectory(model)
+            try {
+                root.mkdirs()
+                File(root, READY_MARKER).delete()
+                var completedBytes = 0L
+                for (item in model.files) {
+                    if (pauseRequested.get()) throw PausedException()
+                    val target = File(root, item.localName)
+                    val source = filesByName[item.localName] ?: filesByName[item.remoteName]
+                    if (source == null) {
+                        if (
+                            target.isFile &&
+                            target.length() == item.size &&
+                            sha256(target).equals(item.sha256, ignoreCase = true)
+                        ) {
+                            completedBytes += item.size
+                            continue
+                        }
+                        throw IllegalStateException("缺少 ${item.remoteName}")
+                    }
+                    val temporary = File(root, "${item.localName}.import")
+                    temporary.delete()
+                    var copiedBytes = 0L
+                    appContext.contentResolver.openInputStream(source)?.buffered().use { input ->
+                        checkNotNull(input) { "无法读取 ${item.remoteName}" }
+                        temporary.outputStream().buffered().use { output ->
+                            val buffer = ByteArray(DEFAULT_BUFFER_SIZE * 4)
+                            while (true) {
+                                if (pauseRequested.get()) throw PausedException()
+                                val count = input.read(buffer)
+                                if (count < 0) break
+                                output.write(buffer, 0, count)
+                                copiedBytes += count
+                                onProgress(
+                                    DownloadProgress(
+                                        downloadedBytes = completedBytes + copiedBytes,
+                                        totalBytes = model.totalBytes,
+                                        message = "正在导入 ${item.localName}",
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                    if (temporary.length() != item.size) {
+                        temporary.delete()
+                        throw IllegalStateException("${item.remoteName} 大小不正确")
+                    }
+                    if (!sha256(temporary).equals(item.sha256, ignoreCase = true)) {
+                        temporary.delete()
+                        throw IllegalStateException("${item.remoteName} 校验失败")
+                    }
+                    if (target.exists()) target.delete()
+                    if (!temporary.renameTo(target)) throw IllegalStateException("无法保存 ${item.localName}")
+                    completedBytes += item.size
+                }
+                File(root, READY_MARKER).writeText("ok\n")
+                onResult(DownloadResult.Completed)
+            } catch (_: PausedException) {
+                onResult(DownloadResult.Paused)
+            } catch (error: Exception) {
+                onResult(DownloadResult.Failed(error.message ?: "导入失败"))
             }
         }
     }
