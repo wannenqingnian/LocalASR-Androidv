@@ -691,8 +691,11 @@ class MainActivity : Activity() {
     }
 
     private fun showSpeakerRenameDialog(text: String, onRenamed: (String) -> Unit) {
-        val labels = SPEAKER_LABEL.findAll(text)
-            .map { it.groupValues[1] }
+        val labels = text.lineSequence()
+            .flatMap { line ->
+                val labelEnd = line.indexOf('：').takeIf { it >= 0 } ?: return@flatMap emptySequence()
+                SPEAKER_LABEL.findAll(line.substring(0, labelEnd)).map { it.value }
+            }
             .distinct()
             .toList()
         if (labels.isEmpty()) {
@@ -719,8 +722,13 @@ class MainActivity : Activity() {
                             showMessage("姓名不能为空")
                             return@setPositiveButton
                         }
-                        val lineLabel = Regex("(?m)^${Regex.escape(oldName)}：")
-                        onRenamed(lineLabel.replace(text) { "$newName：" })
+                        val exactLabel = Regex("${Regex.escape(oldName)}(?!\\d)")
+                        val updatedText = text.lineSequence().joinToString("\n") { line ->
+                            val labelEnd = line.indexOf('：')
+                            if (labelEnd < 0) return@joinToString line
+                            exactLabel.replace(line.substring(0, labelEnd), newName) + line.substring(labelEnd)
+                        }
+                        onRenamed(updatedText)
                     }
                     .show()
             }
@@ -745,13 +753,17 @@ class MainActivity : Activity() {
             showMessage("当前没有可分享的文字")
             return
         }
+        shareText(text, "分享整篇转写")
+    }
+
+    private fun shareText(text: String, chooserTitle: String) {
         startActivity(Intent.createChooser(
             Intent(Intent.ACTION_SEND).apply {
                 type = "text/plain"
                 putExtra(Intent.EXTRA_SUBJECT, "语音转写")
                 putExtra(Intent.EXTRA_TEXT, text)
             },
-            "分享整篇转写",
+            chooserTitle,
         ))
     }
 
@@ -761,8 +773,12 @@ class MainActivity : Activity() {
             showMessage("当前没有可导出的文字")
             return
         }
+        exportText(text, System.currentTimeMillis())
+    }
+
+    private fun exportText(text: String, time: Long) {
         pendingExportText = text
-        val fileName = "LocalASR-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())}.txt"
+        val fileName = "LocalASR-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date(time))}.txt"
         startActivityForResult(
             Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
@@ -1409,19 +1425,22 @@ class MainActivity : Activity() {
     private fun showHistoryActions(session: TranscriptSession) {
         AlertDialog.Builder(this)
             .setTitle("记录操作")
-            .setItems(arrayOf("说话人改名", "删除记录")) { _, which ->
-                if (which == 0) {
-                    showSpeakerRenameDialog(session.text) { updatedText ->
-                        historyDatabase.updateText(session.id, updatedText)
-                        if (AsrForegroundService.lastSavedSessionId == session.id) {
-                            lastTranscript = updatedText
-                            AsrForegroundService.updateLastSavedTranscript(session.id, updatedText)
+            .setItems(arrayOf("分享记录", "导出 TXT", "说话人改名", "删除记录")) { _, which ->
+                when (which) {
+                    0 -> shareText(session.text, "分享转写记录")
+                    1 -> exportText(session.text, session.startedAt)
+                    2 -> {
+                        showSpeakerRenameDialog(session.text) { updatedText ->
+                            historyDatabase.updateText(session.id, updatedText)
+                            if (AsrForegroundService.lastSavedSessionId == session.id) {
+                                lastTranscript = updatedText
+                                AsrForegroundService.updateLastSavedTranscript(session.id, updatedText)
+                            }
+                            showMessage("说话人姓名已统一修改")
+                            showHistoryDetails(session.copy(text = updatedText))
                         }
-                        showMessage("说话人姓名已统一修改")
-                        showHistoryDetails(session.copy(text = updatedText))
                     }
-                } else {
-                    confirmDeleteHistory(session)
+                    3 -> confirmDeleteHistory(session)
                 }
             }
             .setNegativeButton("取消", null)
@@ -1598,7 +1617,7 @@ class MainActivity : Activity() {
         private const val REQUEST_IMPORT_MODEL = 203
         private const val PREFERENCES = "settings"
         private const val KEY_SOURCE = "download_source"
-        private val SPEAKER_LABEL = Regex("(?m)^(说话人\\d+)：")
+        private val SPEAKER_LABEL = Regex("说话人\\d+")
         private val COLOR_BACKGROUND = 0xFFF6F8FC.toInt()
         private val COLOR_PRIMARY = 0xFF3563E9.toInt()
         private val COLOR_PRIMARY_SOFT = 0xFFEEF4FF.toInt()

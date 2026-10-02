@@ -23,6 +23,9 @@ import com.k2fsa.sherpa.onnx.SileroVadModelConfig
 import com.k2fsa.sherpa.onnx.Vad
 import com.k2fsa.sherpa.onnx.VadModelConfig
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -148,6 +151,7 @@ class SpeechRecorder(
         val recorder = createAudioRecord()
         audioRecord = recorder
         committed.clear()
+        currentTurnLabel = null
         startedAt = System.currentTimeMillis()
         recorder.startRecording()
         listener.onReady(startedAt)
@@ -165,12 +169,19 @@ class SpeechRecorder(
         val segmentAudio = mutableListOf<FloatArray>()
         var segmentSampleCount = 0
         var segmentSquaredSum = 0.0
+        var recordedSampleCount = 0L
+        var segmentSpeechStartedAt: Long? = null
         var currentText = ""
         try {
             while (running) {
                 val count = recorder.read(buffer, 0, buffer.size)
                 if (count <= 0) continue
                 val samples = FloatArray(count) { buffer[it] / 32768.0f }
+                val bufferStartedAt = startedAt + recordedSampleCount * 1000L / SAMPLE_RATE
+                recordedSampleCount += count
+                if (segmentSpeechStartedAt == null && hasAudibleSignal(samples)) {
+                    segmentSpeechStartedAt = bufferStartedAt
+                }
                 segmentAudio += samples
                 segmentSampleCount += samples.size
                 for (sample in samples) segmentSquaredSum += sample * sample
@@ -191,10 +202,13 @@ class SpeechRecorder(
                 )
                 if (endpoint) {
                     val speakerSamples = joinSamples(segmentAudio, segmentSampleCount)
-                    if (commit(currentText, speakerSamples)) listener.onSegmentFinalized(committed.toString())
+                    if (commit(currentText, speakerSamples, segmentSpeechStartedAt ?: bufferStartedAt)) {
+                        listener.onSegmentFinalized(committed.toString())
+                    }
                     segmentAudio.clear()
                     segmentSampleCount = 0
                     segmentSquaredSum = 0.0
+                    segmentSpeechStartedAt = null
                     currentText = ""
                     recognizer.reset(stream)
                     listener.onTranscriptChanged(committed.toString())
@@ -206,7 +220,12 @@ class SpeechRecorder(
             stream.inputFinished()
             while (recognizer.isReady(stream)) recognizer.decode(stream)
             val finalText = recognizer.getResult(stream).text.trim().ifBlank { currentText }
-            if (commit(finalText, joinSamples(segmentAudio, segmentSampleCount))) {
+            if (commit(
+                    finalText,
+                    joinSamples(segmentAudio, segmentSampleCount),
+                    segmentSpeechStartedAt ?: startedAt + recordedSampleCount * 1000L / SAMPLE_RATE,
+                )
+            ) {
                 listener.onSegmentFinalized(committed.toString())
             }
             listener.onFinished(committed.toString(), startedAt, System.currentTimeMillis())
@@ -214,7 +233,12 @@ class SpeechRecorder(
             if (running) {
                 listener.onError(error.message ?: "录音处理中断")
             } else {
-                if (commit(currentText, joinSamples(segmentAudio, segmentSampleCount))) {
+                if (commit(
+                        currentText,
+                        joinSamples(segmentAudio, segmentSampleCount),
+                        segmentSpeechStartedAt ?: startedAt + recordedSampleCount * 1000L / SAMPLE_RATE,
+                    )
+                ) {
                     listener.onSegmentFinalized(committed.toString())
                 }
                 listener.onFinished(committed.toString(), startedAt, System.currentTimeMillis())
@@ -248,12 +272,13 @@ class SpeechRecorder(
             while (!vad.empty() && inferenceError.get() == null) {
                 val segment = vad.front()
                 val samples = segment.samples
+                val segmentStartedAt = startedAt + segment.start.toLong() * 1000L / SAMPLE_RATE
                 vad.pop()
                 val task = Runnable {
                     if (inferenceError.get() != null) return@Runnable
                     try {
                         val text = decodeOffline(recognizer, samples)
-                        if (commit(text, samples)) {
+                        if (commit(text, samples, segmentStartedAt)) {
                             listener.onSegmentFinalized(committed.toString())
                             listener.onTranscriptChanged(committed.toString())
                         }
@@ -314,16 +339,13 @@ class SpeechRecorder(
         }
     }
 
-    private fun commit(text: String, samples: FloatArray): Boolean {
+    private fun commit(text: String, samples: FloatArray, segmentStartedAt: Long): Boolean {
         if (text.isBlank()) return false
         if (!containsSpeech(samples)) return false
-        val label = if (hasOverlappingSpeech(samples)) {
-            "多人同时说话"
-        } else {
-            assignSpeaker(samples)?.let { "说话人$it" }
-        }
+        val label = overlappingSpeakerLabel(samples) ?: assignSpeaker(samples)?.let { "说话人$it" }
         if (committed.isNotEmpty() && label != currentTurnLabel) committed.append('\n')
         if (committed.isEmpty() || label != currentTurnLabel) {
+            committed.append(formatTurnTime(segmentStartedAt)).append(' ')
             if (label != null) committed.append(label).append('：')
         } else if (needsWordSpace(committed.last(), text.first())) {
             committed.append(' ')
@@ -345,13 +367,20 @@ class SpeechRecorder(
     private fun needsWordSpace(previous: Char, next: Char): Boolean =
         previous.code < 128 && next.code < 128
 
-    private fun hasOverlappingSpeech(samples: FloatArray): Boolean {
-        val detector = overlapDetector ?: return false
-        return runCatching { detector.hasOverlap(samples) }.getOrElse {
+    private fun overlappingSpeakerLabel(samples: FloatArray): String? {
+        val detector = overlapDetector ?: return null
+        val analysis = runCatching { detector.analyze(samples) }.getOrElse {
             runCatching { detector.release() }
             overlapDetector = null
-            false
+            null
+        } ?: return null
+        val usedSpeakers = mutableSetOf<Int>()
+        val participantNames = analysis.participantSamples.map { participantSamples ->
+            val speaker = assignSpeakerReliable(participantSamples)
+            if (speaker != null && usedSpeakers.add(speaker)) "说话人$speaker" else "未知说话人"
         }
+        if (participantNames.none { it != "未知说话人" }) return "多人同时说话"
+        return "多人同时说话（${participantNames.joinToString("、")}）"
     }
 
     private fun assignSpeaker(samples: FloatArray): Int? {
@@ -362,6 +391,18 @@ class SpeechRecorder(
             null
         }
     }
+
+    private fun assignSpeakerReliable(samples: FloatArray): Int? {
+        val clusterer = speakerClusterer ?: return null
+        return runCatching { clusterer.assignReliable(samples) }.getOrElse {
+            runCatching { clusterer.release() }
+            speakerClusterer = null
+            null
+        }
+    }
+
+    private fun formatTurnTime(time: Long): String =
+        SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(time)).let { "[$it]" }
 
     private fun combinedText(partial: String, hasAudibleSignal: Boolean): String {
         if (partial.isBlank() || !hasAudibleSignal) return committed.toString()

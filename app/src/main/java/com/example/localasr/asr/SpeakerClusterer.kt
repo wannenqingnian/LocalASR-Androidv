@@ -21,6 +21,16 @@ class SpeakerClusterer(modelFile: File) {
     fun assign(samples: FloatArray): Int {
         if (samples.size < MIN_SAMPLES) return lastSpeaker
         val embedding = extract(samples) ?: return lastSpeaker
+        return assignEmbedding(embedding)
+    }
+
+    fun assignReliable(samples: FloatArray): Int? {
+        if (samples.size < MIN_SAMPLES) return null
+        val embedding = extract(samples) ?: return null
+        return assignEmbedding(embedding)
+    }
+
+    private fun assignEmbedding(embedding: FloatArray): Int {
         val best = speakers.indices.maxByOrNull { cosine(embedding, speakers[it].center) }
         val speakerIndex = if (
             best != null && cosine(embedding, speakers[best].center) >= SIMILARITY_THRESHOLD
